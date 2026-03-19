@@ -1,0 +1,25 @@
+{
+  "author": "DigitalSword99",
+  "github_id": "DigitalSword99",
+  "name": "Fugue SwiGLU 10L",
+  "blurb": "SwiGLU activation replacing relu^2, 10 transformer blocks at 512 dim with GQA (8 heads, 4 KV heads). SwiGLU provides better gradient flow and expressiveness per parameter. Extra layer uses headroom freed by improved int8+zlib compression of SwiGLU weights.",
+  "date": "2026-03-19",
+  "val_loss": null,
+  "val_bpb": null,
+  "bytes_total": null,
+  "bytes_code": null,
+  "run_config": {
+    "NUM_LAYERS": 10,
+    "MODEL_DIM": 512,
+    "NUM_HEADS": 8,
+    "NUM_KV_HEADS": 4,
+    "MLP_MULT": 2,
+    "USE_SWIGLU": 1,
+    "VOCAB_SIZE": 1024,
+    "TIE_EMBEDDINGS": 1,
+    "NUM_RECURRENCE_PASSES": 1,
+    "WARMDOWN_ITERS": 1800,
+    "TRAIN_BATCH_TOKENS": 524288,
+    "TRAIN_SEQ_LEN": 1024
+  }
+}
