@@ -15,7 +15,7 @@ Replaces the baseline relu^2 MLP activation with SwiGLU (used in LLaMA, Gemma, a
 ## Architecture
 
 - 10 transformer blocks, 512 model dim
-- 8 attention heads, 4 KV heads (GQA)
+- 8 attention heads, 2 KV heads (GQA 4:1)
 - SwiGLU MLP with 2x expansion (hidden=1024, 3 linear layers per block)
 - 1024 vocab (SentencePiece BPE), tied embeddings
 - ~24M parameters, estimated ~14 MB compressed
@@ -34,7 +34,7 @@ SwiGLU showed -0.051 BPB improvement at 500 steps with 25% step time overhead.
 ```bash
 RUN_ID=fugue_swiglu_10L \
 NUM_LAYERS=10 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 \
-MLP_MULT=2 USE_SWIGLU=1 VOCAB_SIZE=1024 TIE_EMBEDDINGS=1 \
+MLP_MULT=2 USE_SWIGLU=1 NUM_KV_HEADS=2 VOCAB_SIZE=1024 TIE_EMBEDDINGS=1 \
 NUM_RECURRENCE_PASSES=1 WARMDOWN_ITERS=1800 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
