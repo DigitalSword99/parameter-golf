@@ -47,7 +47,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 50))
     compile_warmup_steps = int(os.environ.get("COMPILE_WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
@@ -55,9 +55,9 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape (Hydra Entropy-Aware Int6 config).
+    # Model shape (Hydra v2 config).
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 13))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -69,14 +69,16 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     quant_group_size = int(os.environ.get("QUANT_GROUP_SIZE", 64))
     quant_scale_factor = float(os.environ.get("QUANT_SCALE_FACTOR", 5.0))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
@@ -84,10 +86,15 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    muon_wd = float(os.environ.get("MUON_WD", 0.04))
 
-    # SWA (Stochastic Weight Averaging).
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    # EMA (Exponential Moving Average).
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # SWA (Stochastic Weight Averaging) — disabled by default, EMA preferred.
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))
     swa_every = int(os.environ.get("SWA_EVERY", 100))
 
@@ -353,6 +360,8 @@ def _forward_logits(model: nn.Module, x: Tensor) -> Tensor:
     if hasattr(base, "_orig_mod"):
         base = base._orig_mod
     emb = base.tok_emb(x)
+    if base.bigram_hash is not None:
+        emb = emb + base.bigram_hash(x)
     emb = base._apply_smear_gate(emb)
     h = F.rms_norm(emb, (emb.size(-1),))
     x0 = h
@@ -380,6 +389,7 @@ def _forward_logits(model: nn.Module, x: Tensor) -> Tensor:
 CONTROL_TENSOR_NAME_PATTERNS = (
     "attn_scale", "mlp_scale", "resid_mix", "q_gain",
     "skip_weight", "skip_weights", "pass_gate", "smear_gate",
+    "bigram_hash",
 )
 
 
@@ -621,6 +631,26 @@ class DistributedTokenLoader:
 
 
 # -----------------------------
+# BIGRAM HASH EMBEDDING
+# -----------------------------
+
+class BigramHash(nn.Module):
+    """Hash-based bigram features: embed token pairs for cheap n-gram info."""
+    def __init__(self, num_buckets: int, embed_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.emb = nn.Embedding(num_buckets, embed_dim)
+        self.proj = nn.Linear(embed_dim, model_dim, bias=False) if embed_dim != model_dim else nn.Identity()
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        prev = torch.zeros_like(input_ids)
+        prev[:, 1:] = input_ids[:, :-1]
+        bigram_ids = (prev.long() * 1000003 + input_ids.long()) % self.num_buckets
+        x = self.emb(bigram_ids)
+        return self.proj(x) if not isinstance(self.proj, nn.Identity) else x
+
+
+# -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
 
@@ -753,7 +783,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 num_recurrence_passes: int = 1, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0):
+                 num_recurrence_passes: int = 1, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0,
+                 bigram_hash_buckets: int = 0, bigram_hash_dim: int = 128):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -762,6 +793,9 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_recurrence_passes = num_recurrence_passes
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+
+        # BigramHash: hash-based bigram features.
+        self.bigram_hash = BigramHash(bigram_hash_buckets, bigram_hash_dim, model_dim) if bigram_hash_buckets > 0 else None
 
         # SmearGate: learned previous-token blending.
         self.smear_gate_param = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
@@ -793,9 +827,19 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        num_layers = self.num_unique_layers
         for module in self.modules():
-            if isinstance(module, (nn.Linear,)) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+            if isinstance(module, (nn.Linear, EntropyInt6Linear)):
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                elif module.weight.ndim == 2:
+                    nn.init.orthogonal_(module.weight)
+        # Scale output projections by 1/sqrt(2*num_layers) for stable deep training.
+        for block in self.blocks:
+            with torch.no_grad():
+                scale = 1.0 / math.sqrt(2 * num_layers)
+                block.attn.proj.weight.mul_(scale)
+                block.mlp.proj.weight.mul_(scale)
 
     def _apply_smear_gate(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.smear_gate_param.to(dtype=x.dtype))[None, None, :]
@@ -812,6 +856,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids)
         x = self._apply_smear_gate(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -925,6 +971,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         num_recurrence_passes=args.num_recurrence_passes, use_swiglu=args.use_swiglu,
         group_size=args.quant_group_size, scale_factor=args.quant_scale_factor,
+        bigram_hash_buckets=args.bigram_hash_buckets, bigram_hash_dim=args.bigram_hash_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, (EntropyInt6Linear, CastedLinear)):
@@ -943,6 +990,13 @@ def main() -> None:
         p for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    # BigramHash params: embedding goes with Adam (like tok_emb), proj goes with Muon.
+    bigram_adam_params: list[nn.Parameter] = []
+    if base_model.bigram_hash is not None:
+        bigram_adam_params.append(base_model.bigram_hash.emb.weight)
+        if hasattr(base_model.bigram_hash, 'proj') and isinstance(base_model.bigram_hash.proj, nn.Linear):
+            matrix_params.append(base_model.bigram_hash.proj.weight)
+
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.pass_gate is not None:
@@ -950,8 +1004,9 @@ def main() -> None:
     scalar_params.append(base_model.smear_gate_param)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params_list = [base_model.tok_emb.weight] + bigram_adam_params
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": tok_params_list, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
     )
     optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps)
@@ -976,6 +1031,7 @@ def main() -> None:
     log0(f"quant:int6_entropy group_size={args.quant_group_size} scale_factor={args.quant_scale_factor}")
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
+    log0(f"bigram_hash:{args.bigram_hash_buckets}x{args.bigram_hash_dim} ema:{args.ema_enabled}(decay={args.ema_decay}) muon_wd:{args.muon_wd}")
     log0(f"swa_enabled:{args.swa_enabled} swa_every:{args.swa_every} eval_stride:{args.eval_stride}")
     log0(f"seed:{args.seed}")
 
@@ -1029,6 +1085,11 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # EMA state: shadow copy on CPU.
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_enabled:
+        ema_state = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
 
     # Main training loop.
     training_time_ms = 0.0
@@ -1084,9 +1145,24 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+
+        # Weight decay (decoupled, applied to Muon matrix params).
+        if args.muon_wd > 0:
+            wd_factor = 1.0 - scale * args.matrix_lr * args.muon_wd
+            with torch.no_grad():
+                for p in matrix_params:
+                    p.mul_(wd_factor)
+
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        # EMA update.
+        if ema_state is not None:
+            decay = args.ema_decay
+            with torch.no_grad():
+                for n, t in base_model.state_dict().items():
+                    ema_state[n].mul_(decay).add_(t.detach().cpu(), alpha=1.0 - decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1118,8 +1194,12 @@ def main() -> None:
 
     log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
 
-    # Apply SWA if collected.
-    if swa_state is not None and swa_count > 1:
+    # Apply EMA weights if enabled (preferred over SWA).
+    if ema_state is not None:
+        log0("ema: loading EMA weights")
+        ema_sd = {n: t.to(dtype=base_model.state_dict()[n].dtype) for n, t in ema_state.items()}
+        base_model.load_state_dict(ema_sd, strict=True)
+    elif swa_state is not None and swa_count > 1:
         log0(f"swa: averaging {swa_count} checkpoints")
         avg = {n: (t / swa_count).to(dtype=base_model.state_dict()[n].dtype) for n, t in swa_state.items()}
         base_model.load_state_dict(avg, strict=True)
