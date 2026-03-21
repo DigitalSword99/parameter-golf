@@ -41,7 +41,10 @@
       "Bash(gh pr:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(echo $RUNPOD_API_KEY)",
+      "Bash(python:*)",
+      "Bash(gh api:*)"
     ]
   }
 }
