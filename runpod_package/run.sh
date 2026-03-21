@@ -9,11 +9,12 @@ pip install zstd 2>/dev/null || true
 echo "=== Downloading data + tokenizer ==="
 python data/cached_challenge_fineweb.py
 
-echo "=== Training Hydra v2 (10 min cap on 8xH100) ==="
-RUN_ID=hydra_v2_11L_512d \
-NUM_LAYERS=11 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 \
+echo "=== Training Deep-and-Compressed (13L int5, 10 min cap on 8xH100) ==="
+RUN_ID=deep_compressed_13L_int5 \
+NUM_LAYERS=13 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 \
 MLP_MULT=3 VOCAB_SIZE=1024 TIE_EMBEDDINGS=1 \
 TRAIN_SEQ_LEN=2048 ROPE_BASE=10000 \
+QUANT_BITS=5 QUANT_SCALE_FACTOR=3.0 QUANT_GROUP_SIZE=64 \
 BIGRAM_HASH_BUCKETS=4096 BIGRAM_HASH_DIM=128 \
 EMA_ENABLED=1 EMA_DECAY=0.997 \
 SWA_ENABLED=0 \

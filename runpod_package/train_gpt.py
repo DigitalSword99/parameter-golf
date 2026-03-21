@@ -57,7 +57,7 @@ class Hyperparameters:
 
     # Model shape (Hydra v2 config).
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 13))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -68,7 +68,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     quant_group_size = int(os.environ.get("QUANT_GROUP_SIZE", 64))
-    quant_scale_factor = float(os.environ.get("QUANT_SCALE_FACTOR", 5.0))
+    quant_scale_factor = float(os.environ.get("QUANT_SCALE_FACTOR", 3.0))
+    quant_bits = int(os.environ.get("QUANT_BITS", 5))
     bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
@@ -393,17 +394,19 @@ CONTROL_TENSOR_NAME_PATTERNS = (
 )
 
 
-class EntropyInt6Linear(nn.Linear):
-    """Int6 QAT with entropy-aware absmean scaling.
-    Weights kept in fp32 for optimizer. Forward quantizes to 6-bit [-31, 31]
-    using absmean scaling which concentrates values near zero for better
-    LZMA compression. STE passes gradients unchanged.
+class QuantizedLinear(nn.Linear):
+    """Configurable QAT with entropy-aware absmean scaling.
+    Supports int5 [-15,15] and int6 [-31,31]. Weights kept in fp32 for optimizer.
+    Forward quantizes using absmean scaling which concentrates values near zero
+    for better compression. STE passes gradients unchanged.
     """
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 group_size: int = 64, scale_factor: float = 5.0):
+                 group_size: int = 64, scale_factor: float = 5.0, quant_bits: int = 5):
         super().__init__(in_features, out_features, bias=bias)
         self.group_size = group_size
         self.scale_factor = scale_factor
+        self.quant_bits = quant_bits
+        self.clamp_max = (1 << (quant_bits - 1)) - 1  # int5=15, int6=31
         self._cached_q: Tensor | None = None
         self._cached_scale: Tensor | None = None
         self._cached_shape: tuple | None = None
@@ -412,12 +415,10 @@ class EntropyInt6Linear(nn.Linear):
         shape = w.shape
         g = self.group_size
         sf = self.scale_factor
+        cm = self.clamp_max
         w_flat = w.reshape(-1, g)
-        # Absmean scaling: concentrates quantized values near zero.
-        # Unlike max scaling (which wastes dynamic range on outliers),
-        # absmean gives full resolution to the 99.8% of weights near zero.
         scale = w_flat.abs().mean(-1, keepdim=True).clamp(min=1e-8).half().float()
-        q = (w_flat / scale * sf).round().clamp(-31, 31)
+        q = (w_flat / scale * sf).round().clamp(-cm, cm)
         self._cached_q = q.detach().to(torch.int8)
         self._cached_scale = scale.detach().squeeze(-1).half()
         self._cached_shape = shape
@@ -427,6 +428,9 @@ class EntropyInt6Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w_q = self._quantize_weights(self.weight)
         return F.linear(x, w_q.to(x.dtype), self.bias)
+
+# Backward compat alias.
+EntropyInt6Linear = QuantizedLinear
 
 
 class CastedLinear(nn.Linear):
@@ -469,8 +473,9 @@ def unpack_int6(data: bytes, numel: int) -> Tensor:
 # ENTROPY-AWARE INT6 SERIALIZATION
 # -----------------------------
 
-def quantize_state_dict_int6(model: nn.Module) -> tuple[dict, dict]:
-    """Serialize EntropyInt6Linear layers via cached int6 weights + 6-bit packing.
+def quantize_state_dict(model: nn.Module) -> tuple[dict, dict]:
+    """Serialize QuantizedLinear layers via cached quantized weights.
+    Int6 uses 6-bit packing. Int5 stores as int8 (zstd handles compression).
     Non-quantized params stored as fp16."""
     quantized: dict[str, dict] = {}
     passthrough: dict[str, Tensor] = {}
@@ -478,13 +483,17 @@ def quantize_state_dict_int6(model: nn.Module) -> tuple[dict, dict]:
     quant_weight_names: set[str] = set()
 
     for name, module in model.named_modules():
-        if isinstance(module, EntropyInt6Linear) and module._cached_q is not None:
+        if isinstance(module, QuantizedLinear) and module._cached_q is not None:
             weight_name = name + ".weight"
             quant_weight_names.add(weight_name)
             q = module._cached_q.cpu()
             scale = module._cached_scale.cpu()
             shape = module._cached_shape
-            packed = pack_int6(q)
+            bits = module.quant_bits
+            if bits == 6:
+                packed = pack_int6(q)
+            else:
+                packed = q.flatten().numpy().astype(np.int8).tobytes()
             quantized[weight_name] = {
                 "packed": packed,
                 "scale": scale,
@@ -492,6 +501,7 @@ def quantize_state_dict_int6(model: nn.Module) -> tuple[dict, dict]:
                 "numel": q.numel(),
                 "group_size": module.group_size,
                 "scale_factor": module.scale_factor,
+                "quant_bits": bits,
             }
             stats["param_count"] += q.numel()
             stats["payload_bytes"] += len(packed) + scale.numel() * 2
@@ -508,15 +518,19 @@ def quantize_state_dict_int6(model: nn.Module) -> tuple[dict, dict]:
             stats["param_count"] += t.numel()
             stats["payload_bytes"] += t.numel() * t.element_size()
 
-    obj = {"__format__": "entropy_int6_v1", "quantized": quantized, "passthrough": passthrough}
+    obj = {"__format__": "entropy_quant_v2", "quantized": quantized, "passthrough": passthrough}
     return obj, stats
 
 
-def dequantize_state_dict_int6(obj: dict) -> dict[str, Tensor]:
-    """Reconstruct state dict from entropy-aware int6 serialized format."""
+def dequantize_state_dict(obj: dict) -> dict[str, Tensor]:
+    """Reconstruct state dict from quantized serialized format."""
     out: dict[str, Tensor] = {}
     for name, entry in obj["quantized"].items():
-        q = unpack_int6(entry["packed"], entry["numel"])
+        bits = entry.get("quant_bits", 6)
+        if bits == 6:
+            q = unpack_int6(entry["packed"], entry["numel"])
+        else:
+            q = torch.from_numpy(np.frombuffer(entry["packed"], dtype=np.int8).copy()[:entry["numel"]])
         g = entry["group_size"]
         sf = entry["scale_factor"]
         q = q.reshape(-1, g).float()
@@ -702,7 +716,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float,
-                 group_size: int = 64, scale_factor: float = 5.0, rope_frac: float = 0.25, use_xsa: bool = False):
+                 group_size: int = 64, scale_factor: float = 5.0, quant_bits: int = 5, rope_frac: float = 0.25, use_xsa: bool = False):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -717,10 +731,10 @@ class CausalSelfAttention(nn.Module):
         # Partial RoPE: only apply rotary to a fraction of head dims.
         self.rope_dims = max(2, int(self.head_dim * rope_frac) // 2 * 2)  # must be even
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
-        self.c_k = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor)
-        self.c_v = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor)
-        self.proj = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
+        self.c_q = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
+        self.c_k = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
+        self.c_v = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
+        self.proj = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dims, base=rope_base)
@@ -760,14 +774,14 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0):
+    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0, quant_bits: int = 5):
         super().__init__()
         hidden = mlp_mult * dim
         self.use_swiglu = use_swiglu
-        self.fc = EntropyInt6Linear(dim, hidden, bias=False, group_size=group_size, scale_factor=scale_factor)
+        self.fc = EntropyInt6Linear(dim, hidden, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
         if use_swiglu:
-            self.gate = EntropyInt6Linear(dim, hidden, bias=False, group_size=group_size, scale_factor=scale_factor)
-        self.proj = EntropyInt6Linear(hidden, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
+            self.gate = EntropyInt6Linear(dim, hidden, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
+        self.proj = EntropyInt6Linear(hidden, dim, bias=False, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -780,13 +794,14 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, use_swiglu: bool = False,
-                 group_size: int = 64, scale_factor: float = 5.0, use_xsa: bool = False):
+                 group_size: int = 64, scale_factor: float = 5.0, quant_bits: int = 5, use_xsa: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        group_size=group_size, scale_factor=scale_factor, use_xsa=use_xsa)
-        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor)
+                                        group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits,
+                                        use_xsa=use_xsa)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor, quant_bits=quant_bits)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -805,7 +820,7 @@ class GPT(nn.Module):
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
                  num_recurrence_passes: int = 1, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0,
-                 bigram_hash_buckets: int = 0, bigram_hash_dim: int = 128):
+                 quant_bits: int = 5, bigram_hash_buckets: int = 0, bigram_hash_dim: int = 128):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -833,7 +848,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor,
-                  use_xsa=(i >= xsa_start))
+                  quant_bits=quant_bits, use_xsa=(i >= xsa_start))
             for i in range(num_layers)
         ])
 
@@ -996,7 +1011,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         num_recurrence_passes=args.num_recurrence_passes, use_swiglu=args.use_swiglu,
-        group_size=args.quant_group_size, scale_factor=args.quant_scale_factor,
+        group_size=args.quant_group_size, scale_factor=args.quant_scale_factor, quant_bits=args.quant_bits,
         bigram_hash_buckets=args.bigram_hash_buckets, bigram_hash_dim=args.bigram_hash_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1054,7 +1069,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"quant:int6_entropy group_size={args.quant_group_size} scale_factor={args.quant_scale_factor}")
+    log0(f"quant:int{args.quant_bits}_entropy group_size={args.quant_group_size} scale_factor={args.quant_scale_factor}")
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
     log0(f"bigram_hash:{args.bigram_hash_buckets}x{args.bigram_hash_dim} ema:{args.ema_enabled}(decay={args.ema_decay}) muon_wd:{args.muon_wd}")
@@ -1248,26 +1263,26 @@ def main() -> None:
         log0(f"Total submission size (raw): {model_bytes + code_bytes} bytes")
 
     # Int6 entropy-aware quantization + compression.
-    quant_obj, quant_stats = quantize_state_dict_int6(base_model)
+    quant_obj, quant_stats = quantize_state_dict(base_model)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob, comp_name = compress_best(quant_raw)
     if master_process:
-        with open("final_model.int6.ptz", "wb") as f:
+        with open("final_model.quant.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{comp_name}: {quant_file_bytes} bytes (payload:{quant_stats['payload_bytes']})")
-        log0(f"Total submission size int6: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int{args.quant_bits}+{comp_name}: {quant_file_bytes} bytes (payload:{quant_stats['payload_bytes']})")
+        log0(f"Total submission size quant: {quant_file_bytes + code_bytes} bytes")
 
     # Roundtrip validation.
     if distributed:
         dist.barrier()
-    with open("final_model.int6.ptz", "rb") as f:
+    with open("final_model.quant.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(decompress_auto(quant_blob_disk)), map_location="cpu", weights_only=False)
-    base_model.load_state_dict(dequantize_state_dict_int6(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1275,8 +1290,8 @@ def main() -> None:
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
-    log0(f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
-    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
+    log0(f"final_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     # TTT (Test-Time Training): fine-tune quantized model on validation tokens.
     # Freeze first 2 blocks for stability. 3 epochs of SGD.
