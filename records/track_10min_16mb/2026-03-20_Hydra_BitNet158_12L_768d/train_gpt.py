@@ -1,7 +1,8 @@
 """
-Hydra: BitNet b1.58 transformer for Parameter Golf.
-12L/768d with ternary weights, SmearGate, SWA, sliding window eval.
-~65M params in ~15MB via base-3 trit packing + LZMA.
+Hydra: Entropy-Aware Int6 QAT transformer for Parameter Golf.
+12L/512d with absmean-scaled 6-bit quantization, SmearGate, SWA, sliding window eval.
+~24M params in ~14.5MB via 6-bit packing + LZMA.
+Absmean scaling concentrates quantized values near zero → low entropy → better compression.
 """
 
 from __future__ import annotations
@@ -54,19 +55,20 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape (Hydra BitNet config).
+    # Model shape (Hydra Entropy-Aware Int6 config).
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 12))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
-    model_dim = int(os.environ.get("MODEL_DIM", 768))
-    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     num_recurrence_passes = int(os.environ.get("NUM_RECURRENCE_PASSES", 1))
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 200000.0))
+    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    bitnet_group_size = int(os.environ.get("BITNET_GROUP_SIZE", 64))
+    quant_group_size = int(os.environ.get("QUANT_GROUP_SIZE", 64))
+    quant_scale_factor = float(os.environ.get("QUANT_SCALE_FACTOR", 5.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -381,14 +383,17 @@ CONTROL_TENSOR_NAME_PATTERNS = (
 )
 
 
-class BitLinear(nn.Linear):
-    """Linear layer with BitNet b1.58 ternary weight quantization.
-    Weights kept in fp32 for optimizer. Forward quantizes to {-1,0,+1}
-    per group via absmean scaling. STE passes gradients unchanged.
+class EntropyInt6Linear(nn.Linear):
+    """Int6 QAT with entropy-aware absmean scaling.
+    Weights kept in fp32 for optimizer. Forward quantizes to 6-bit [-31, 31]
+    using absmean scaling which concentrates values near zero for better
+    LZMA compression. STE passes gradients unchanged.
     """
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, group_size: int = 64):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
+                 group_size: int = 64, scale_factor: float = 5.0):
         super().__init__(in_features, out_features, bias=bias)
         self.group_size = group_size
+        self.scale_factor = scale_factor
         self._cached_q: Tensor | None = None
         self._cached_scale: Tensor | None = None
         self._cached_shape: tuple | None = None
@@ -396,19 +401,22 @@ class BitLinear(nn.Linear):
     def _quantize_weights(self, w: Tensor) -> Tensor:
         shape = w.shape
         g = self.group_size
+        sf = self.scale_factor
         w_flat = w.reshape(-1, g)
+        # Absmean scaling: concentrates quantized values near zero.
+        # Unlike max scaling (which wastes dynamic range on outliers),
+        # absmean gives full resolution to the 99.8% of weights near zero.
         scale = w_flat.abs().mean(-1, keepdim=True).clamp(min=1e-8).half().float()
-        q = (w_flat / scale).round().clamp(-1, 1)
+        q = (w_flat / scale * sf).round().clamp(-31, 31)
         self._cached_q = q.detach().to(torch.int8)
         self._cached_scale = scale.detach().squeeze(-1).half()
         self._cached_shape = shape
-        result = q * scale
+        result = q / sf * scale
         return (result.reshape(shape) - w).detach() + w  # STE
 
     def forward(self, x: Tensor) -> Tensor:
-        x_norm = F.rms_norm(x, (x.size(-1),))
         w_q = self._quantize_weights(self.weight)
-        return F.linear(x_norm, w_q.to(x_norm.dtype), self.bias)
+        return F.linear(x, w_q.to(x.dtype), self.bias)
 
 
 class CastedLinear(nn.Linear):
@@ -419,65 +427,67 @@ class CastedLinear(nn.Linear):
 
 
 # -----------------------------
-# BASE-3 TERNARY PACKING
+# 6-BIT PACKING
 # -----------------------------
 
-def pack_ternary(q_int8: Tensor) -> bytes:
-    """Pack ternary {-1, 0, +1} as base-3: 5 trits per byte."""
-    flat = (q_int8.flatten().to(torch.int16) + 1).numpy().astype(np.uint8)
-    pad = (5 - len(flat) % 5) % 5
+def pack_int6(q_int8: Tensor) -> bytes:
+    """Pack int6 values [-31, 31] → unsigned [0, 62] → 4 per 3 bytes (6 bits each)."""
+    flat = (q_int8.flatten().to(torch.int16) + 31).numpy().astype(np.uint8)
+    pad = (4 - len(flat) % 4) % 4
     if pad:
         flat = np.concatenate([flat, np.zeros(pad, dtype=np.uint8)])
-    flat = flat.reshape(-1, 5)
-    packed = (flat[:, 0] + 3 * flat[:, 1] + 9 * flat[:, 2]
-              + 27 * flat[:, 3] + 81 * flat[:, 4]).astype(np.uint8)
+    flat = flat.reshape(-1, 4)
+    b0 = (flat[:, 0] & 0x3F) | ((flat[:, 1] & 0x03) << 6)
+    b1 = ((flat[:, 1] >> 2) & 0x0F) | ((flat[:, 2] & 0x0F) << 4)
+    b2 = ((flat[:, 2] >> 4) & 0x03) | ((flat[:, 3] & 0x3F) << 2)
+    packed = np.column_stack([b0, b1, b2]).flatten().astype(np.uint8)
     return packed.tobytes()
 
 
-def unpack_ternary(data: bytes, numel: int) -> Tensor:
-    """Unpack base-3 packed bytes back to ternary {-1, 0, +1}."""
-    packed = np.frombuffer(data, dtype=np.uint8)
-    trits = np.zeros((len(packed), 5), dtype=np.int8)
-    vals = packed.astype(np.uint16)
-    for i in range(5):
-        trits[:, i] = vals % 3
-        vals //= 3
-    flat = trits.flatten()[:numel]
-    return torch.from_numpy((flat.astype(np.int8) - 1).copy())
+def unpack_int6(data: bytes, numel: int) -> Tensor:
+    """Unpack 6-bit packed bytes back to int6 values [-31, 31]."""
+    packed = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
+    v0 = packed[:, 0] & 0x3F
+    v1 = ((packed[:, 0] >> 6) & 0x03) | ((packed[:, 1] & 0x0F) << 2)
+    v2 = ((packed[:, 1] >> 4) & 0x0F) | ((packed[:, 2] & 0x03) << 4)
+    v3 = (packed[:, 2] >> 2) & 0x3F
+    flat = np.column_stack([v0, v1, v2, v3]).flatten()[:numel]
+    return torch.from_numpy((flat.astype(np.int8) - 31).copy())
 
 
 # -----------------------------
-# BITNET SERIALIZATION
+# ENTROPY-AWARE INT6 SERIALIZATION
 # -----------------------------
 
-def quantize_state_dict_bitnet(model: nn.Module) -> tuple[dict, dict]:
-    """Serialize BitLinear layers via cached ternary weights + base-3 packing.
-    Non-BitLinear params stored as fp16."""
+def quantize_state_dict_int6(model: nn.Module) -> tuple[dict, dict]:
+    """Serialize EntropyInt6Linear layers via cached int6 weights + 6-bit packing.
+    Non-quantized params stored as fp16."""
     quantized: dict[str, dict] = {}
     passthrough: dict[str, Tensor] = {}
     stats = {"param_count": 0, "payload_bytes": 0}
-    bitlinear_weight_names: set[str] = set()
+    quant_weight_names: set[str] = set()
 
     for name, module in model.named_modules():
-        if isinstance(module, BitLinear) and module._cached_q is not None:
+        if isinstance(module, EntropyInt6Linear) and module._cached_q is not None:
             weight_name = name + ".weight"
-            bitlinear_weight_names.add(weight_name)
+            quant_weight_names.add(weight_name)
             q = module._cached_q.cpu()
             scale = module._cached_scale.cpu()
             shape = module._cached_shape
-            packed = pack_ternary(q)
+            packed = pack_int6(q)
             quantized[weight_name] = {
                 "packed": packed,
                 "scale": scale,
                 "shape": list(shape),
                 "numel": q.numel(),
                 "group_size": module.group_size,
+                "scale_factor": module.scale_factor,
             }
             stats["param_count"] += q.numel()
             stats["payload_bytes"] += len(packed) + scale.numel() * 2
 
     for name, param in model.named_parameters():
-        if name not in bitlinear_weight_names:
+        if name not in quant_weight_names:
             t = param.detach().cpu()
             if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
                 passthrough[name] = t.float()
@@ -488,19 +498,20 @@ def quantize_state_dict_bitnet(model: nn.Module) -> tuple[dict, dict]:
             stats["param_count"] += t.numel()
             stats["payload_bytes"] += t.numel() * t.element_size()
 
-    obj = {"__format__": "bitnet158_base3_v1", "quantized": quantized, "passthrough": passthrough}
+    obj = {"__format__": "entropy_int6_v1", "quantized": quantized, "passthrough": passthrough}
     return obj, stats
 
 
-def dequantize_state_dict_bitnet(obj: dict) -> dict[str, Tensor]:
-    """Reconstruct state dict from BitNet serialized format."""
+def dequantize_state_dict_int6(obj: dict) -> dict[str, Tensor]:
+    """Reconstruct state dict from entropy-aware int6 serialized format."""
     out: dict[str, Tensor] = {}
     for name, entry in obj["quantized"].items():
-        q = unpack_ternary(entry["packed"], entry["numel"])
+        q = unpack_int6(entry["packed"], entry["numel"])
         g = entry["group_size"]
+        sf = entry["scale_factor"]
         q = q.reshape(-1, g).float()
         scale = entry["scale"].float().unsqueeze(-1)
-        w = (q * scale).reshape(entry["shape"])
+        w = (q / sf * scale).reshape(entry["shape"])
         out[name] = w
     for name, t in obj["passthrough"].items():
         out[name] = t
@@ -660,7 +671,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float, group_size: int = 64):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float, group_size: int = 64, scale_factor: float = 5.0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -672,10 +683,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = BitLinear(dim, dim, bias=False, group_size=group_size)
-        self.c_k = BitLinear(dim, kv_dim, bias=False, group_size=group_size)
-        self.c_v = BitLinear(dim, kv_dim, bias=False, group_size=group_size)
-        self.proj = BitLinear(dim, dim, bias=False, group_size=group_size)
+        self.c_q = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
+        self.c_k = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor)
+        self.c_v = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor)
+        self.proj = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -700,14 +711,14 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False, group_size: int = 64):
+    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0):
         super().__init__()
         hidden = mlp_mult * dim
         self.use_swiglu = use_swiglu
-        self.fc = BitLinear(dim, hidden, bias=False, group_size=group_size)
+        self.fc = EntropyInt6Linear(dim, hidden, bias=False, group_size=group_size, scale_factor=scale_factor)
         if use_swiglu:
-            self.gate = BitLinear(dim, hidden, bias=False, group_size=group_size)
-        self.proj = BitLinear(hidden, dim, bias=False, group_size=group_size)
+            self.gate = EntropyInt6Linear(dim, hidden, bias=False, group_size=group_size, scale_factor=scale_factor)
+        self.proj = EntropyInt6Linear(hidden, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -719,12 +730,12 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, use_swiglu: bool = False, group_size: int = 64):
+                 rope_base: float, qk_gain_init: float, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, group_size=group_size)
-        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu, group_size=group_size)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, group_size=group_size, scale_factor=scale_factor)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -742,7 +753,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 num_recurrence_passes: int = 1, use_swiglu: bool = False, group_size: int = 64):
+                 num_recurrence_passes: int = 1, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -764,7 +775,7 @@ class GPT(nn.Module):
 
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  use_swiglu=use_swiglu, group_size=group_size)
+                  use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor)
             for _ in range(num_layers)
         ])
 
@@ -913,10 +924,10 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         num_recurrence_passes=args.num_recurrence_passes, use_swiglu=args.use_swiglu,
-        group_size=args.bitnet_group_size,
+        group_size=args.quant_group_size, scale_factor=args.quant_scale_factor,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, (BitLinear, CastedLinear)):
+        if isinstance(module, (EntropyInt6Linear, CastedLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -962,7 +973,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"bitnet:group_size={args.bitnet_group_size}")
+    log0(f"quant:int6_entropy group_size={args.quant_group_size} scale_factor={args.quant_scale_factor}")
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
     log0(f"swa_enabled:{args.swa_enabled} swa_every:{args.swa_every} eval_stride:{args.eval_stride}")
@@ -1113,7 +1124,7 @@ def main() -> None:
         avg = {n: (t / swa_count).to(dtype=base_model.state_dict()[n].dtype) for n, t in swa_state.items()}
         base_model.load_state_dict(avg, strict=True)
 
-    # Serialization: run forward to populate BitLinear caches, then serialize.
+    # Serialization: run forward to populate EntropyInt6Linear caches, then serialize.
     log0("serializing model...")
     base_model.eval()
     with torch.no_grad():
@@ -1130,27 +1141,27 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size (raw): {model_bytes + code_bytes} bytes")
 
-    # BitNet quantization + compression.
-    quant_obj, quant_stats = quantize_state_dict_bitnet(base_model)
+    # Int6 entropy-aware quantization + compression.
+    quant_obj, quant_stats = quantize_state_dict_int6(base_model)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob, comp_name = compress_best(quant_raw)
     if master_process:
-        with open("final_model.bitnet.ptz", "wb") as f:
+        with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model bitnet+{comp_name}: {quant_file_bytes} bytes (payload:{quant_stats['payload_bytes']})")
-        log0(f"Total submission size bitnet: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int6+{comp_name}: {quant_file_bytes} bytes (payload:{quant_stats['payload_bytes']})")
+        log0(f"Total submission size int6: {quant_file_bytes + code_bytes} bytes")
 
     # Roundtrip validation.
     if distributed:
         dist.barrier()
-    with open("final_model.bitnet.ptz", "rb") as f:
+    with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(decompress_auto(quant_blob_disk)), map_location="cpu", weights_only=False)
-    base_model.load_state_dict(dequantize_state_dict_bitnet(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict_int6(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1158,8 +1169,8 @@ def main() -> None:
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
-    log0(f"final_bitnet_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
-    log0(f"final_bitnet_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
+    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

@@ -36,7 +36,9 @@
       "WebFetch(domain:www.runpod.io)",
       "Bash(ssh-keygen -t ed25519 -C \"john@learnlogos.com\" -f ~/.ssh/id_ed25519 -N \"\")",
       "Read(//home/falla/.ssh/**)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(gh pr:*)"
     ]
   }
 }
