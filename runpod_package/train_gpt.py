@@ -701,7 +701,8 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float, group_size: int = 64, scale_factor: float = 5.0):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float,
+                 group_size: int = 64, scale_factor: float = 5.0, rope_frac: float = 0.25, use_xsa: bool = False):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -712,6 +713,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.use_xsa = use_xsa
+        # Partial RoPE: only apply rotary to a fraction of head dims.
+        self.rope_dims = max(2, int(self.head_dim * rope_frac) // 2 * 2)  # must be even
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
         self.c_k = EntropyInt6Linear(dim, kv_dim, bias=False, group_size=group_size, scale_factor=scale_factor)
@@ -719,7 +723,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = EntropyInt6Linear(dim, dim, bias=False, group_size=group_size, scale_factor=scale_factor)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -728,14 +732,29 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+        # Partial RoPE: only rotate first rope_dims dimensions.
+        rd = self.rope_dims
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q_rope, q_pass = q[..., :rd], q[..., rd:]
+        k_rope, k_pass = k[..., :rd], k[..., rd:]
+        q = torch.cat([apply_rotary_emb(q_rope, cos, sin), q_pass], dim=-1)
+        k = torch.cat([apply_rotary_emb(k_rope, cos, sin), k_pass], dim=-1)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # XSA: subtract self-value projection to force cross-token information.
+        if self.use_xsa:
+            # Expand v for GQA if needed
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                v_exp = v.repeat_interleave(rep, dim=1)
+            else:
+                v_exp = v
+            dot = (y * v_exp).sum(-1, keepdim=True)
+            norm = (v_exp * v_exp).sum(-1, keepdim=True).clamp(min=1e-8)
+            y = y - (dot / norm) * v_exp
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -760,11 +779,13 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, use_swiglu: bool = False, group_size: int = 64, scale_factor: float = 5.0):
+                 rope_base: float, qk_gain_init: float, use_swiglu: bool = False,
+                 group_size: int = 64, scale_factor: float = 5.0, use_xsa: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, group_size=group_size, scale_factor=scale_factor)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        group_size=group_size, scale_factor=scale_factor, use_xsa=use_xsa)
         self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -807,10 +828,13 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
+        # XSA on last 4 layers.
+        xsa_start = max(0, num_layers - 4)
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor)
-            for _ in range(num_layers)
+                  use_swiglu=use_swiglu, group_size=group_size, scale_factor=scale_factor,
+                  use_xsa=(i >= xsa_start))
+            for i in range(num_layers)
         ])
 
         if num_recurrence_passes > 1:
@@ -849,6 +873,8 @@ class GPT(nn.Module):
     def _run_block(self, eff_idx: int, x: Tensor, x0: Tensor) -> Tensor:
         block_idx = eff_idx % self.num_unique_layers
         x = self.blocks[block_idx](x, x0)
+        # LN Scale: damp deeper layers by 1/sqrt(layer+1) for stable deep training.
+        x = x * (1.0 / math.sqrt(eff_idx + 1))
         if self.pass_gate is not None:
             pass_idx = eff_idx // self.num_unique_layers
             x = x * self.pass_gate[pass_idx].to(dtype=x.dtype)[None, None, :]
@@ -1251,6 +1277,68 @@ def main() -> None:
     torch.cuda.synchronize()
     log0(f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # TTT (Test-Time Training): fine-tune quantized model on validation tokens.
+    # Freeze first 2 blocks for stability. 3 epochs of SGD.
+    log0("ttt: starting test-time training on validation tokens...")
+    base_model.train()
+    # Freeze first 2 blocks.
+    for i, block in enumerate(base_model.blocks):
+        if i < 2:
+            for p in block.parameters():
+                p.requires_grad_(False)
+    # Also freeze embedding (already quantized to FP16).
+    base_model.tok_emb.weight.requires_grad_(False)
+    if base_model.bigram_hash is not None:
+        for p in base_model.bigram_hash.parameters():
+            p.requires_grad_(False)
+
+    ttt_lr = 0.002
+    ttt_epochs = 3
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    ttt_opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+    ttt_seq_len = args.train_seq_len
+    ttt_batch_seqs = max(1, args.val_batch_size // (world_size * ttt_seq_len))
+    total_val_seqs = (val_tokens.numel() - 1) // ttt_seq_len
+
+    t_ttt = time.perf_counter()
+    for epoch in range(ttt_epochs):
+        ttt_loss_sum = 0.0
+        ttt_steps = 0
+        for batch_start in range(0, total_val_seqs, ttt_batch_seqs * world_size):
+            seq_start = batch_start + rank * ttt_batch_seqs
+            seq_end = min(seq_start + ttt_batch_seqs, total_val_seqs)
+            if seq_start >= total_val_seqs:
+                break
+            raw_s = seq_start * ttt_seq_len
+            raw_e = seq_end * ttt_seq_len + 1
+            local = val_tokens[raw_s:raw_e].to(device=device, dtype=torch.int64)
+            x_ttt = local[:-1].reshape(-1, ttt_seq_len)
+            y_ttt = local[1:].reshape(-1, ttt_seq_len)
+            if x_ttt.size(0) == 0:
+                continue
+            ttt_opt.zero_grad()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                ttt_loss = base_model(x_ttt, y_ttt)
+            ttt_loss.backward()
+            ttt_opt.step()
+            ttt_loss_sum += ttt_loss.item()
+            ttt_steps += 1
+        if ttt_steps > 0:
+            log0(f"ttt: epoch {epoch+1}/{ttt_epochs} loss:{ttt_loss_sum/ttt_steps:.4f}")
+    log0(f"ttt: done in {time.perf_counter() - t_ttt:.1f}s")
+
+    # Final eval after TTT.
+    base_model.eval()
+    torch.cuda.synchronize()
+    t_final = time.perf_counter()
+    final_val_loss, final_val_bpb = eval_val(
+        args, model, rank, world_size, device, grad_accum_steps, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(f"final_after_ttt val_loss:{final_val_loss:.4f} val_bpb:{final_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_final):.0f}ms")
+    log0(f"final_after_ttt_exact val_loss:{final_val_loss:.8f} val_bpb:{final_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
