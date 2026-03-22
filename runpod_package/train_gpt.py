@@ -231,12 +231,13 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    use_sliding: bool = True,
 ) -> tuple[float, float]:
     seq_len = args.train_seq_len
     stride = args.eval_stride
 
     # Sliding window eval: overlapping windows scored with near-full context.
-    if stride > 0 and stride < seq_len:
+    if use_sliding and stride > 0 and stride < seq_len:
         return _eval_val_sliding(
             args, model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
@@ -1144,13 +1145,15 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            # Sliding window only on final step; fast non-sliding eval for intermediate.
             val_loss, val_bpb = eval_val(
                 args, model, rank, world_size, device, grad_accum_steps, val_tokens,
                 base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                use_sliding=last_step,
             )
             log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
             torch.cuda.synchronize()
@@ -1288,6 +1291,7 @@ def main() -> None:
     q_val_loss, q_val_bpb = eval_val(
         args, model, rank, world_size, device, grad_accum_steps, val_tokens,
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        use_sliding=False,
     )
     torch.cuda.synchronize()
     log0(f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
