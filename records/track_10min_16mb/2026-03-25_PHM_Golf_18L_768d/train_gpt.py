@@ -342,13 +342,9 @@ def quantize_apot_to_indices(t: Tensor, levels: Tensor) -> tuple[Tensor, Tensor,
     lev = levels.to(abs_vals.device)
     dists = (abs_vals.unsqueeze(-1) - lev.unsqueeze(0).unsqueeze(0)).abs()
     indices = dists.argmin(dim=-1).to(torch.uint8)
-    # Pack signs: 1 bit per element
-    is_neg = (normalized < 0).reshape(-1)
-    num_bytes = (is_neg.numel() + 7) // 8
-    sign_bytes = torch.zeros(num_bytes, dtype=torch.uint8)
-    for bit in range(is_neg.numel()):
-        if is_neg[bit]:
-            sign_bytes[bit // 8] |= (1 << (bit % 8))
+    # Pack signs: 1 bit per element, vectorized via numpy
+    is_neg = (normalized < 0).reshape(-1).cpu().numpy()
+    sign_bytes = torch.from_numpy(np.packbits(is_neg, bitorder='little'))
     return indices, sign_bytes, scale.squeeze(-1).to(torch.float16)
 
 def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) -> tuple[Tensor, Tensor, Tensor]:
@@ -376,14 +372,10 @@ def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) ->
         if mse < best_mse:
             best_mse = mse
             best_result = (indices.to(torch.uint8), normalized, scale.squeeze(-1).to(torch.float16))
-    # Pack signs from best result
+    # Pack signs from best result (vectorized via numpy)
     _, normalized_best, scale_best = best_result
-    is_neg = (normalized_best < 0).reshape(-1)
-    num_bytes = (is_neg.numel() + 7) // 8
-    sign_bytes = torch.zeros(num_bytes, dtype=torch.uint8)
-    for bit in range(is_neg.numel()):
-        if is_neg[bit]:
-            sign_bytes[bit // 8] |= (1 << (bit % 8))
+    is_neg = (normalized_best < 0).reshape(-1).cpu().numpy()
+    sign_bytes = torch.from_numpy(np.packbits(is_neg, bitorder='little'))
     return best_result[0], sign_bytes, scale_best
 
 def dequantize_apot_from_indices(indices: Tensor, sign_bytes: Tensor, scales: Tensor, levels: Tensor) -> Tensor:
@@ -391,10 +383,10 @@ def dequantize_apot_from_indices(indices: Tensor, sign_bytes: Tensor, scales: Te
     q_abs = lev[indices.long()]
     rows, cols = indices.shape
     total = rows * cols
+    # Unpack signs vectorized via numpy
+    sign_bits = np.unpackbits(sign_bytes.cpu().numpy(), bitorder='little')[:total]
     signs = torch.ones(total, device=indices.device)
-    for bit in range(total):
-        if bit < sign_bytes.numel() * 8 and (sign_bytes[bit // 8].item() & (1 << (bit % 8))):
-            signs[bit] = -1.0
+    signs[torch.from_numpy(sign_bits.astype(bool))] = -1.0
     return q_abs * signs.reshape(rows, cols) * scales.float().unsqueeze(1)
 
 def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
@@ -793,10 +785,9 @@ class GPT(nn.Module):
             connections = []
             if 0 <= sym_partner < self.num_encoder_layers:
                 connections.append(sym_partner)
-            # Every 4th deeper encoder layer
-            for enc_i in range(sym_partner + 4, self.num_encoder_layers, 4):
-                if 0 <= enc_i < self.num_encoder_layers:
-                    connections.append(enc_i)
+            # Every 4th deeper encoder layer (toward input, lower indices)
+            for enc_i in range(sym_partner - 4, -1, -4):
+                connections.append(enc_i)
             self.skip_map[dec_i] = connections
 
         total_skip_connections = sum(len(v) for v in self.skip_map.values())
@@ -1120,10 +1111,7 @@ def main() -> None:
         elif p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
             scalar_params.append(p)
 
-    # Rotary learned frequencies → scalar optimizer
-    for name, p in base_model.named_parameters():
-        if 'inv_freq' in name:
-            scalar_params.append(p)
+    # inv_freq already captured by block iteration (matches CONTROL_TENSOR_NAME_PATTERNS)
 
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1197,6 +1185,9 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        # LR warmup ramp for first 50 steps
+        if step < args.warmup_steps:
+            return step / max(args.warmup_steps, 1)
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
@@ -1259,7 +1250,7 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
