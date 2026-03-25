@@ -330,31 +330,24 @@ def build_apot_levels(bit_width: int = 6) -> Tensor:
 
 APOT_LEVELS = build_apot_levels(6)
 
-def quantize_apot_to_indices(t: Tensor, levels: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """Quantize 2D tensor to APoT level indices + packed signs + per-row scales."""
-    t32 = t.float()
-    rows, cols = t32.shape
-    row_max = t32.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
-    max_level = levels[-1].item()
-    scale = row_max / max_level
-    normalized = t32 / scale
-    abs_vals = normalized.abs()
-    lev = levels.to(abs_vals.device)
-    dists = (abs_vals.unsqueeze(-1) - lev.unsqueeze(0).unsqueeze(0)).abs()
-    indices = dists.argmin(dim=-1).to(torch.uint8)
-    # Pack signs: 1 bit per element, vectorized via numpy
-    is_neg = (normalized < 0).reshape(-1).cpu().numpy()
-    sign_bytes = torch.from_numpy(np.packbits(is_neg, bitorder='little'))
-    return indices, sign_bytes, scale.squeeze(-1).to(torch.float16)
+def build_signed_apot_codebook(levels: Tensor) -> Tensor:
+    """Build signed codebook: [-max, ..., -1, 0, 1, ..., max]. Index 0 = most negative."""
+    pos = levels[levels > 0]
+    neg = -pos.flip(0)
+    return torch.cat([neg, torch.zeros(1), pos])  # len = 2*num_positive + 1
 
-def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) -> tuple[Tensor, Tensor, Tensor]:
-    """Per-row optimal APoT quantization with clip percentile search."""
+APOT_CODEBOOK = build_signed_apot_codebook(APOT_LEVELS)  # 51 entries, fits in int8 (-25 to +25)
+
+def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, codebook: Tensor, n_candidates: int = 5) -> tuple[Tensor, Tensor]:
+    """Per-row APoT quantization with GPTQ-lite clip search.
+    Returns (signed_indices: int8, scales: fp16). No separate sign storage needed."""
     t32 = t.float()
     candidates = [0.999, 0.9995, 0.9999, 0.99999, 1.0][:n_candidates]
-    best_result = None
+    best_indices = None
+    best_scale = None
     best_mse = float('inf')
     max_level = levels[-1].item()
-    lev = levels.to(t32.device)
+    cb = codebook.to(t32.device)
     for pct in candidates:
         if pct < 1.0:
             clip_abs = torch.quantile(t32.abs(), pct, dim=1, keepdim=True)
@@ -363,39 +356,33 @@ def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) ->
         clip_abs = clip_abs.clamp_min(1e-8)
         scale = clip_abs / max_level
         normalized = (t32 / scale).clamp(-max_level, max_level)
-        abs_vals = normalized.abs()
-        dists = (abs_vals.unsqueeze(-1) - lev.unsqueeze(0).unsqueeze(0)).abs()
+        # Find nearest signed codebook entry for each element
+        dists = (normalized.unsqueeze(-1) - cb.unsqueeze(0).unsqueeze(0)).abs()
         indices = dists.argmin(dim=-1)
-        q_abs = lev[indices]
-        q_vals = q_abs * normalized.sign() * scale
+        # Reconstruct to compute MSE
+        q_vals = cb[indices] * scale
         mse = (q_vals - t32).pow(2).mean().item()
         if mse < best_mse:
             best_mse = mse
-            best_result = (indices.to(torch.uint8), normalized, scale.squeeze(-1).to(torch.float16))
-    # Pack signs from best result (vectorized via numpy)
-    _, normalized_best, scale_best = best_result
-    is_neg = (normalized_best < 0).reshape(-1).cpu().numpy()
-    sign_bytes = torch.from_numpy(np.packbits(is_neg, bitorder='little'))
-    return best_result[0], sign_bytes, scale_best
+            best_indices = indices.to(torch.int8)  # int8: -128..127, we use 0..50
+            best_scale = scale.squeeze(-1).to(torch.float16)
+    return best_indices, best_scale
 
-def dequantize_apot_from_indices(indices: Tensor, sign_bytes: Tensor, scales: Tensor, levels: Tensor) -> Tensor:
-    lev = levels.to(indices.device)
-    q_abs = lev[indices.long()]
-    rows, cols = indices.shape
-    total = rows * cols
-    # Unpack signs vectorized via numpy
-    sign_bits = np.unpackbits(sign_bytes.cpu().numpy(), bitorder='little')[:total]
-    signs = torch.ones(total, device=indices.device)
-    signs[torch.from_numpy(sign_bits.astype(bool))] = -1.0
-    return q_abs * signs.reshape(rows, cols) * scales.float().unsqueeze(1)
+def dequantize_apot(indices: Tensor, scales: Tensor, codebook: Tensor) -> Tensor:
+    """Reconstruct float tensor from signed codebook indices + per-row scales."""
+    cb = codebook.to(indices.device)
+    q_vals = cb[indices.long()]  # (rows, cols) — already signed
+    return q_vals * scales.float().unsqueeze(1)
 
 def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
+    """Quantize PHM model using signed APoT codebook indices (int8) + per-row fp16 scales.
+    No separate sign storage — signs are embedded in the codebook index."""
     q_indices: dict[str, Tensor] = {}
-    q_signs: dict[str, Tensor] = {}
     q_scales: dict[str, Tensor] = {}
     passthrough: dict[str, Tensor] = {}
     stats = {"param_count": 0, "total_bytes": 0}
-    levels = build_apot_levels(6)
+    levels = APOT_LEVELS
+    codebook = APOT_CODEBOOK
 
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
@@ -413,44 +400,41 @@ def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
             stats["total_bytes"] += t.numel() * 2
             continue
         if t.ndim == 3 and '.S' in name:
-            idx_slices, sign_slices, scale_slices = [], [], []
+            idx_slices, scale_slices = [], []
             for i in range(t.shape[0]):
-                idx, signs, sc = quantize_apot_gptq_lite(t[i], levels)
+                idx, sc = quantize_apot_gptq_lite(t[i], levels, codebook)
                 idx_slices.append(idx)
-                sign_slices.append(signs)
                 scale_slices.append(sc)
             q_indices[name] = torch.stack(idx_slices)
-            q_signs[name] = torch.stack(sign_slices)
             q_scales[name] = torch.stack(scale_slices)
-            stats["total_bytes"] += q_indices[name].numel() + q_signs[name].numel() + q_scales[name].numel() * 2
+            stats["total_bytes"] += q_indices[name].numel() + q_scales[name].numel() * 2
             continue
         if t.ndim == 2 and t.numel() > 65_536:
-            idx, signs, sc = quantize_apot_gptq_lite(t, levels)
+            idx, sc = quantize_apot_gptq_lite(t, levels, codebook)
             q_indices[name] = idx
-            q_signs[name] = signs
             q_scales[name] = sc
-            stats["total_bytes"] += idx.numel() + signs.numel() + sc.numel() * 2
+            stats["total_bytes"] += idx.numel() + sc.numel() * 2
             continue
         passthrough[name] = t.to(torch.float16)
         stats["total_bytes"] += t.numel() * 2
 
-    return {"q_indices": q_indices, "q_signs": q_signs, "q_scales": q_scales,
-            "passthrough": passthrough, "apot_levels": levels}, stats
+    return {"q_indices": q_indices, "q_scales": q_scales,
+            "passthrough": passthrough, "apot_codebook": codebook}, stats
 
 def dequantize_state_dict_phm(obj: dict[str, object]) -> dict[str, Tensor]:
+    """Reconstruct float tensors from signed APoT codebook indices."""
     out: dict[str, Tensor] = {}
-    levels = obj["apot_levels"]
+    codebook = obj["apot_codebook"]
     for name in obj["q_indices"]:
         indices = obj["q_indices"][name]
-        signs = obj["q_signs"][name]
         scales = obj["q_scales"][name]
         if indices.ndim == 3:
             slices = []
             for i in range(indices.shape[0]):
-                slices.append(dequantize_apot_from_indices(indices[i], signs[i], scales[i], levels))
+                slices.append(dequantize_apot(indices[i], scales[i], codebook))
             out[name] = torch.stack(slices)
         else:
-            out[name] = dequantize_apot_from_indices(indices, signs, scales, levels)
+            out[name] = dequantize_apot(indices, scales, codebook)
     for name, t in obj["passthrough"].items():
         out[name] = t
     return out
