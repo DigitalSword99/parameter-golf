@@ -1080,7 +1080,9 @@ def main() -> None:
         elif isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # fullgraph=False required: gradient checkpointing uses saved_tensors_hooks
+    # which creates graph breaks incompatible with fullgraph=True
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # PHM parameter groups
