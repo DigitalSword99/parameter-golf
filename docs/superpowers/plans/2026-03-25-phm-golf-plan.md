@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a Kronecker-factored (PHM) transformer that fits 18L/768d into 16MB, targeting 1.085-1.115 BPB on FineWeb validation.
+**Goal:** Build a Kronecker-factored (PHM) transformer that fits 18L/768d into 16MB, targeting 1.095-1.12 BPB on FineWeb validation.
 
 **Architecture:** Copy baseline `train_gpt.py` to records folder, then incrementally replace CastedLinear with PHMLinear, swap to 18L/768d, add proven leaderboard techniques (BigramHash, XSA, LeakyReLU², EMA, etc.), and add novel innovations (learned-frequency RoPE, multi-resolution skips, learnable layer scaling, APoT quantization, K-FAC TTT).
 
@@ -81,7 +81,8 @@ Insert after line 515 (end of CastedLinear):
 class PHMLinear(nn.Module):
     """Parameterized Hypercomplex Multiplication layer.
     Represents W = Σᵢ Aᵢ ⊗ Sᵢ using Kronecker factorization.
-    4x parameter reduction, ~3.7x fewer FLOPs via factored forward."""
+    4x parameter reduction. FLOPs are O(d²) same as standard linear —
+    the advantage is storing 4x fewer parameters, not faster compute."""
 
     def __init__(self, in_features: int, out_features: int, n: int = 4, bias: bool = False):
         super().__init__()
@@ -109,7 +110,7 @@ class PHMLinear(nn.Module):
             self.S.data[i] *= 1.0 / math.sqrt(self.n)
 
     def forward(self, x: Tensor) -> Tensor:
-        # Efficient 2-step factored forward (3.7x fewer FLOPs than full matmul):
+        # 2-step factored forward (same FLOPs as standard linear, but 4x fewer stored params):
         # Step 1: Apply filter matrices — T[b,k,i,o] = Σ_l X[b,k,l] * S[i,o,l]
         # Step 2: Mix blocks via algebra  — y[b,j,o] = Σ_{i,k} A[i,j,k] * T[b,k,i,o]
         bsz = x.shape[:-1]
@@ -756,7 +757,7 @@ if base_model.lm_head is not None:
 
 - [ ] **Step 2: Update Muon to handle 3D tensors (PHM S matrices)**
 
-The S parameter is (n, s_out, s_in). Muon's Newton-Schulz expects 2D. Reshape each S to (n*s_out, s_in) before NS5, then reshape back:
+The S parameter is (n, s_out, s_in). Muon's Newton-Schulz expects 2D. Apply NS5 to each factor slice INDEPENDENTLY (not concatenated — concatenation would force cross-factor orthogonality, destroying per-factor spectral structure):
 
 In the Muon optimizer step, update the gradient processing:
 
@@ -766,12 +767,12 @@ In the Muon optimizer step, update the gradient processing:
 #   g *= max(1, g.size(0) / g.size(1)) ** 0.5
 # With:
 if g.ndim == 3:
-    # PHM S matrix: (n, s_out, s_in) → flatten to (n*s_out, s_in) for NS5
-    n_fac, s_out, s_in = g.shape
-    g_2d = g.reshape(n_fac * s_out, s_in)
-    g_2d = zeropower_via_newtonschulz5(g_2d, steps=backend_steps)
-    g_2d *= max(1, g_2d.size(0) / g_2d.size(1)) ** 0.5
-    g = g_2d.reshape(n_fac, s_out, s_in)
+    # PHM S matrix: (n, s_out, s_in) → apply NS5 per-slice independently
+    # Each factor's gradient is orthogonalized on its own, preserving
+    # per-factor spectral structure that the A matrices rely on.
+    for i in range(g.size(0)):
+        g[i] = zeropower_via_newtonschulz5(g[i], steps=backend_steps)
+        g[i] *= max(1, g[i].size(0) / g[i].size(1)) ** 0.5
 else:
     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -783,10 +784,11 @@ In Muon.step(), after the update application, add WD:
 
 ```python
 # After: p.add_(g, alpha=-lr)
-# Add weight decay (decoupled, like AdamW):
+# Add decoupled weight decay (uses base_lr, NOT schedule-scaled lr):
 wd = group.get("wd", 0.0)
 if wd > 0:
-    p.add_(p, alpha=-lr * wd)
+    base_lr = group.get("base_lr", lr)
+    p.add_(p, alpha=-base_lr * wd)
 ```
 
 And in the Muon instantiation:
@@ -951,49 +953,60 @@ def build_apot_levels(bit_width: int = 6) -> Tensor:
 
 APOT_LEVELS = build_apot_levels(6)  # Module-level constant
 
-def quantize_apot(t: Tensor, levels: Tensor) -> tuple[Tensor, Tensor]:
-    """Quantize tensor to nearest APoT level with per-row scaling.
-    Returns (quantized_indices, scales)."""
+def quantize_apot_to_indices(t: Tensor, levels: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Quantize 2D tensor to APoT level INDICES (not float values) with per-row scaling.
+    Returns (indices: uint8, signs: uint8 packed bits, scales: fp16).
+    Indices are 0..num_levels-1 into the APoT level table.
+    Signs are bit-packed (8 signs per byte)."""
     t32 = t.float()
-    if t32.ndim == 2:
-        # Per-row scale: map row max to max APoT level
-        row_max = t32.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
-        max_level = levels[-1].item()
-        scale = row_max / max_level  # (rows, 1)
-        normalized = t32 / scale     # values now in [-max_level, max_level]
-        # Quantize: find nearest level for abs, then restore sign
-        abs_vals = normalized.abs()
-        lev = levels.to(abs_vals.device)
-        # For each element, find nearest level index
-        dists = (abs_vals.unsqueeze(-1) - lev.unsqueeze(0).unsqueeze(0)).abs()
-        indices = dists.argmin(dim=-1)  # (rows, cols)
-        # Reconstruct quantized values
-        q_abs = lev[indices]
-        q_vals = q_abs * normalized.sign()
-        return q_vals * scale, scale.squeeze(-1)
-    # Fallback: per-tensor for non-2D
-    abs_max = t32.abs().max().clamp_min(1e-8)
+    assert t32.ndim == 2, "quantize_apot_to_indices requires 2D input"
+    rows, cols = t32.shape
+    # Per-row scale
+    row_max = t32.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
     max_level = levels[-1].item()
-    scale = abs_max / max_level
+    scale = row_max / max_level
     normalized = t32 / scale
-    lev = levels.to(t32.device)
-    dists = (normalized.abs().reshape(-1, 1) - lev.unsqueeze(0)).abs()
-    indices = dists.argmin(dim=-1).reshape(t32.shape)
-    q_abs = lev[indices]
-    q_vals = q_abs * normalized.sign()
-    return q_vals * scale, scale
+    # Find nearest level index for each abs value
+    abs_vals = normalized.abs()
+    lev = levels.to(abs_vals.device)
+    dists = (abs_vals.unsqueeze(-1) - lev.unsqueeze(0).unsqueeze(0)).abs()
+    indices = dists.argmin(dim=-1).to(torch.uint8)  # (rows, cols), values 0..25
+    # Pack signs: 1 bit per element, 8 per byte
+    signs_flat = (normalized < 0).reshape(-1)
+    num_sign_bytes = (signs_flat.numel() + 7) // 8
+    sign_bytes = torch.zeros(num_sign_bytes, dtype=torch.uint8)
+    for bit_idx in range(signs_flat.numel()):
+        if signs_flat[bit_idx]:
+            sign_bytes[bit_idx // 8] |= (1 << (bit_idx % 8))
+    return indices, sign_bytes, scale.squeeze(-1).to(torch.float16)
+
+def dequantize_apot_from_indices(
+    indices: Tensor, sign_bytes: Tensor, scales: Tensor, levels: Tensor
+) -> Tensor:
+    """Reconstruct float tensor from APoT indices + signs + scales."""
+    lev = levels.to(indices.device)
+    q_abs = lev[indices.long()]  # (rows, cols)
+    # Unpack signs
+    rows, cols = indices.shape
+    signs = torch.ones(rows * cols, device=indices.device)
+    for bit_idx in range(rows * cols):
+        if sign_bytes[bit_idx // 8] & (1 << (bit_idx % 8)):
+            signs[bit_idx] = -1.0
+    signs = signs.reshape(rows, cols)
+    return q_abs * signs * scales.float().unsqueeze(1)
 ```
 
 - [ ] **Step 2: Add GPTQ-lite APoT clip search**
 
 ```python
-def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) -> tuple[Tensor, Tensor]:
-    """Per-row optimal APoT quantization with clip percentile search."""
-    if t.ndim != 2:
-        return quantize_apot(t, levels)
+def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-row optimal APoT quantization with clip percentile search.
+    Returns (indices: uint8, sign_bytes: uint8, scales: fp16) — compact storage."""
+    assert t.ndim == 2, "GPTQ-lite requires 2D input"
     t32 = t.float()
     candidates = [0.999, 0.9995, 0.9999, 0.99999, 1.0][:n_candidates]
-    best_q = None
+    best_indices = None
+    best_signs = None
     best_scale = None
     best_mse = float('inf')
     max_level = levels[-1].item()
@@ -1009,14 +1022,23 @@ def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, n_candidates: int = 5) ->
         abs_vals = normalized.abs()
         dists = (abs_vals.unsqueeze(-1) - lev.unsqueeze(0).unsqueeze(0)).abs()
         indices = dists.argmin(dim=-1)
+        # Reconstruct to compute MSE
         q_abs = lev[indices]
         q_vals = q_abs * normalized.sign() * scale
         mse = (q_vals - t32).pow(2).mean().item()
         if mse < best_mse:
             best_mse = mse
-            best_q = q_vals
-            best_scale = scale.squeeze(-1)
-    return best_q, best_scale
+            best_indices = indices.to(torch.uint8)
+            # Pack signs
+            signs_flat = (normalized < 0).reshape(-1)
+            num_sign_bytes = (signs_flat.numel() + 7) // 8
+            sign_bytes = torch.zeros(num_sign_bytes, dtype=torch.uint8)
+            for bit_idx in range(signs_flat.numel()):
+                if signs_flat[bit_idx]:
+                    sign_bytes[bit_idx // 8] |= (1 << (bit_idx % 8))
+            best_signs = sign_bytes
+            best_scale = scale.squeeze(-1).to(torch.float16)
+    return best_indices, best_signs, best_scale
 ```
 
 - [ ] **Step 3: Commit**
@@ -1042,9 +1064,12 @@ Modify `quantize_state_dict_int8` → `quantize_state_dict_phm`:
 
 ```python
 def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
-    """Quantize PHM model: APoT on S matrices, fp32 on A matrices, fp16 on embeddings."""
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
+    """Quantize PHM model: APoT INDICES on S matrices, fp32 on A matrices, fp16 on embeddings.
+    CRITICAL: stores uint8 indices + packed sign bits, NOT float32 values.
+    This is what makes the 16MB budget achievable."""
+    q_indices: dict[str, Tensor] = {}  # uint8 APoT level indices
+    q_signs: dict[str, Tensor] = {}    # bit-packed sign bytes
+    q_scales: dict[str, Tensor] = {}   # fp16 per-row scales
     passthrough: dict[str, Tensor] = {}
     stats = {"param_count": 0, "total_bytes": 0}
     levels = build_apot_levels(6)
@@ -1071,42 +1096,60 @@ def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
             stats["total_bytes"] += t.numel() * 2
             continue
 
-        # PHM S matrices (3D: n, s_out, s_in): quantize each slice
+        # PHM S matrices (3D: n, s_out, s_in): quantize each slice to indices
         if t.ndim == 3 and '.S' in name:
-            q_slices = []
-            s_slices = []
+            idx_slices, sign_slices, scale_slices = [], [], []
             for i in range(t.shape[0]):
-                q_slice, s_slice = quantize_apot_gptq_lite(t[i], levels)
-                q_slices.append(q_slice)
-                s_slices.append(s_slice)
-            quantized[name] = torch.stack(q_slices)
-            scales[name] = torch.stack(s_slices).to(torch.float16)
-            stats["total_bytes"] += quantized[name].numel() + scales[name].numel() * 2
+                idx, signs, sc = quantize_apot_gptq_lite(t[i], levels)
+                idx_slices.append(idx)
+                sign_slices.append(signs)
+                scale_slices.append(sc)
+            q_indices[name] = torch.stack(idx_slices)        # uint8 (n, s_out, s_in)
+            q_signs[name] = torch.stack(sign_slices)          # uint8 packed bits
+            q_scales[name] = torch.stack(scale_slices)        # fp16 (n, s_out)
+            # Size: 1 byte/index + ~0.125 byte/sign + 2 bytes/scale per row
+            stats["total_bytes"] += q_indices[name].numel() + q_signs[name].numel() + q_scales[name].numel() * 2
             continue
 
-        # 2D matrices (embeddings, bigram hash, lm_head): APoT quantize
+        # 2D matrices (embeddings, bigram hash): quantize to indices
         if t.ndim == 2 and t.numel() > 65_536:
-            q, s = quantize_apot_gptq_lite(t, levels)
-            quantized[name] = q
-            scales[name] = s.to(torch.float16)
-            stats["total_bytes"] += q.numel() + s.numel() * 2
+            idx, signs, sc = quantize_apot_gptq_lite(t, levels)
+            q_indices[name] = idx
+            q_signs[name] = signs
+            q_scales[name] = sc
+            stats["total_bytes"] += idx.numel() + signs.numel() + sc.numel() * 2
             continue
 
         # Fallback: fp16
         passthrough[name] = t.to(torch.float16)
         stats["total_bytes"] += t.numel() * 2
 
-    return {"quantized": quantized, "scales": scales, "passthrough": passthrough}, stats
+    return {
+        "q_indices": q_indices, "q_signs": q_signs, "q_scales": q_scales,
+        "passthrough": passthrough, "apot_levels": levels,
+    }, stats
 ```
 
 - [ ] **Step 2: Update dequantize function**
 
 ```python
 def dequantize_state_dict_phm(obj: dict[str, object]) -> dict[str, Tensor]:
+    """Reconstruct float tensors from packed APoT indices + signs + scales."""
     out: dict[str, Tensor] = {}
-    for name, q in obj["quantized"].items():
-        # Already dequantized by quantize_apot (stores float values, not indices)
-        out[name] = q.float()
+    levels = obj["apot_levels"]
+    for name in obj["q_indices"]:
+        indices = obj["q_indices"][name]
+        signs = obj["q_signs"][name]
+        scales = obj["q_scales"][name]
+        if indices.ndim == 3:
+            # PHM S matrix: (n, s_out, s_in) — dequantize each slice
+            slices = []
+            for i in range(indices.shape[0]):
+                slices.append(dequantize_apot_from_indices(
+                    indices[i], signs[i], scales[i], levels))
+            out[name] = torch.stack(slices)
+        else:
+            out[name] = dequantize_apot_from_indices(indices, signs, scales, levels)
     for name, t in obj["passthrough"].items():
         out[name] = t
     return out
@@ -1195,7 +1238,6 @@ git commit -am "feat: PHM-aware serialization with APoT + LZMA compression"
 ```python
 def eval_val_ttt(
     args: Hyperparameters,
-    model: nn.Module,
     base_model: nn.Module,
     rank: int,
     world_size: int,
@@ -1208,7 +1250,9 @@ def eval_val_ttt(
     ttt_epochs: int = 3,
     chunk_size: int = 32768,
 ) -> tuple[float, float]:
-    """Legal Score-First TTT: score each chunk, then adapt, never train on unscored data."""
+    """Legal Score-First TTT: score each chunk, then adapt, never train on unscored data.
+    IMPORTANT: Uses base_model directly (uncompiled) to avoid torch.compile graph
+    invalidation when changing gradient flow during TTT adaptation."""
     # Split val tokens into non-overlapping chunks
     total_tokens = val_tokens.numel() - 1
     num_chunks = total_tokens // chunk_size
@@ -1216,14 +1260,14 @@ def eval_val_ttt(
         num_chunks = 1
         chunk_size = total_tokens
 
-    # Collect S parameters for TTT (freeze A matrices)
+    # Collect S parameters for TTT adaptation.
+    # Do NOT use requires_grad_(False) — it would invalidate torch.compile graphs.
+    # Instead, only pass S params to TTT optimizer; other params get gradients
+    # computed but not applied (optimizer simply doesn't touch them).
     ttt_params = []
     for name, p in base_model.named_parameters():
         if '.S' in name and p.ndim == 3:
-            p.requires_grad_(True)
             ttt_params.append(p)
-        else:
-            p.requires_grad_(False)
 
     val_loss_sum = 0.0
     val_token_count = 0
@@ -1234,8 +1278,8 @@ def eval_val_ttt(
         end = min(start + chunk_size + 1, val_tokens.numel())
         chunk_tokens = val_tokens[start:end].to(device=device, dtype=torch.int64)
 
-        # Phase 1: SCORE — compute loss under current model (no gradients)
-        model.eval()
+        # Phase 1: SCORE — compute loss under current base_model (no gradients)
+        base_model.eval()
         with torch.inference_mode():
             num_seqs = (chunk_tokens.numel() - 1) // args.train_seq_len
             if num_seqs == 0:
@@ -1244,7 +1288,7 @@ def eval_val_ttt(
             x = chunk_tokens[:usable].reshape(num_seqs, args.train_seq_len)
             y = chunk_tokens[1:usable + 1].reshape(num_seqs, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                chunk_loss = model(x, y).item()
+                chunk_loss = base_model(x, y).item()
 
             # Accumulate BPB metrics
             prev_ids = x.reshape(-1)
@@ -1256,8 +1300,9 @@ def eval_val_ttt(
             val_byte_count += token_bytes.sum().item()
 
         # Phase 2: ADAPT — train on this scored chunk (skip last chunk)
+        # Uses base_model (uncompiled) to avoid torch.compile graph conflicts
         if chunk_idx < num_chunks - 1:
-            model.train()
+            base_model.train()
             ttt_optimizer = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
             for epoch in range(ttt_epochs):
                 # Cosine decay per chunk
@@ -1266,14 +1311,10 @@ def eval_val_ttt(
                     pg['lr'] = epoch_lr
                 ttt_optimizer.zero_grad()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = model(x, y)
+                    loss = base_model(x, y)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
                 ttt_optimizer.step()
-
-    # Re-enable all gradients
-    for p in base_model.parameters():
-        p.requires_grad_(True)
 
     # Aggregate across ranks
     if dist.is_available() and dist.is_initialized():

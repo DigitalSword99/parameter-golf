@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-25
 **Author:** John (DigitalSword99) + Claude
-**Target:** Beat SOTA 1.1194 BPB → aim for 1.085-1.11 BPB
+**Target:** Beat SOTA 1.1194 BPB → aim for 1.095-1.115 BPB
 
 ## Problem
 
@@ -22,15 +22,17 @@ Where:
 
 **Benefits:**
 1. **4x parameter reduction** on all linear layers
-2. **~4x fewer FLOPs** per forward pass (no full W materialized)
-3. **More training steps** in the 10-minute budget
-4. **Same param count buys 18L/768d** instead of 11L/512d
+2. **Same param count buys 18L/768d** instead of 11L/512d — nearly 2x deeper, 50% wider
+3. **Unique architectural bet** — nobody else uses structural matrix factorization
+
+**Note on FLOPs:** PHM does NOT reduce FLOPs. The two-step einsum computes the same O(d²) work as a standard linear layer (the contraction over the filter dimension dominates). Training step speed is comparable to baseline. The advantage is purely in parameter efficiency: more model capacity per stored byte.
 
 **Efficient forward pass** (avoids materializing the full weight matrix):
 ```python
 # x: (B, seq, d_in) → reshape to (B, seq, n, d_in//n)
-# y = Σᵢ Sᵢ @ X @ Aᵢᵀ  — batched via einsum
-# FLOPs: O(d²/n) vs O(d²) for standard linear
+# Step 1: T = einsum('bkl,iol->bkio', X, S)  — apply filters within blocks
+# Step 2: y = einsum('ijk,bkio->bjo', A, T)  — mix blocks via algebra
+# FLOPs: O(d²) same as standard, but stores only O(d²/n) parameters
 ```
 
 ## Architecture: PHM-Golf
@@ -56,18 +58,23 @@ Embedding: 1024 vocab × 768d, tied with output head, fp16
 ### Size Estimate
 
 ```
-S_i matrices:     ~22.5M × 0.75 bytes (int6)  = 16.9 MB
-A_i matrices:     ~35K   × 4 bytes (fp32)      = 0.14 MB
-Embedding:        786K   × 2 bytes (fp16)       = 1.57 MB
-BigramHash:       1,180K × 2 bytes (fp16)       = 2.36 MB
-Control tensors:  ~100K  × 4 bytes (fp32)       = 0.40 MB
+S_i matrices:     ~22.5M × 0.875 bytes (7-bit packed: 6-bit index + sign)  = 19.7 MB
+  Per-row scales:  ~117K  × 2 bytes (fp16)                                 =  0.23 MB
+A_i matrices:     ~7K    × 4 bytes (fp32)                                  =  0.03 MB
+Embedding:        786K   × 2 bytes (fp16)                                  =  1.57 MB
+BigramHash:       1,180K × 2 bytes (fp16)                                  =  2.36 MB
+Control tensors:  ~100K  × 4 bytes (fp32)                                  =  0.40 MB
                                             ─────────────
-Pre-compression:                              ~21.4 MB
-LZMA compression (~0.65x on APoT int6):      ~13.9 MB
+Pre-compression:                              ~24.3 MB
+LZMA compression (~0.55x on packed indices):  ~13.4 MB
 Code:                                         + 0.10 MB
                                             ─────────────
-Estimated artifact:                           ~14.0 MB
-Headroom:                                      2.0 MB
+Estimated artifact:                           ~13.5 MB
+Headroom:                                      2.5 MB
+
+Note: 7-bit packing stores 8 values in 7 bytes. LZMA ratio of 0.55x is
+conservative — APoT indices cluster near zero (non-uniform), giving LZMA
+better compression than uniform random data (which achieves ~0.75x).
 ```
 
 ## Novel Techniques (6 innovations)
@@ -87,7 +94,9 @@ Replace uniform int6 with APoT 6-bit. Each weight represented as sum of powers o
 w = ±(2^a + 2^b + 2^c)    where a > b > c ≥ 0
 ```
 
-Quantization levels are denser near zero, matching the bell-shaped weight distribution. Sparse bit patterns compress better under LZMA.
+Quantization levels are denser near zero, matching the bell-shaped weight distribution.
+
+**Serialization:** Weights are stored as packed 7-bit values (6-bit APoT level index + 1 sign bit), NOT as float32. A shared codebook of ~26 non-negative APoT levels is stored once. Per-row fp16 scales allow reconstruction: `weight = sign * levels[index] * scale[row]`. The 7-bit packing (8 values per 7 bytes) plus non-uniform index distribution gives excellent LZMA compression.
 
 **QAT integration:** Fake-quantize S_i matrices during forward pass with STE. A_i matrices stay fp32.
 
@@ -122,9 +131,10 @@ This gives approximate natural gradient TTT at the cost of SGD. Faster convergen
 **Protocol (same as Legal Score-First):**
 1. Split val tokens into non-overlapping 32K-token chunks
 2. Score each chunk under `torch.inference_mode()` (record loss)
-3. Adapt with K-FAC SGD: lr=0.002, 3 epochs, cosine decay, all S_i unfrozen
-4. A_i matrices frozen during TTT (algebra structure should be stable)
+3. Adapt with SGD: lr=0.002, 3 epochs, cosine decay, all S_i unfrozen
+4. A_i matrices: zero out gradients after backward (not requires_grad=False, to avoid torch.compile graph invalidation)
 5. Last chunk scored but never trained on
+6. TTT uses uncompiled base_model directly to avoid torch.compile conflicts
 
 ### 5. Multi-Resolution Skip Connections
 
@@ -172,7 +182,8 @@ scale = 0.5 * (1 + cos(π * progress))  # progress: 0→1 during warmdown
 
 ```
 Optimizer:
-  S_i matrices     → Muon, lr=0.04, WD=0.04, momentum 0.85→0.99 (warmup 500 steps)
+  S_i matrices     → Muon, lr=0.04, WD=0.04 (decoupled, uses base_lr), momentum 0.85→0.99 (warmup 500 steps)
+  Note: Muon applies NS5 per-slice on each (s_out, s_in) factor independently, NOT concatenated
   A_i matrices     → Adam, lr=0.01, β1=0.9, β2=0.95
   Embedding        → Adam, lr=0.05
   BigramHash       → Adam, lr=0.05
@@ -181,7 +192,7 @@ Optimizer:
 Schedule:
   Compile warmup:    20 steps (reset model + optimizer state after)
   LR warmup:         50 steps
-  Main training:     ~10,000-12,000 steps (faster step time → more steps)
+  Main training:     ~8,000-10,000 steps (same step speed as baseline)
   Cosine warmdown:   last 3500 steps
   EMA:               0.997 → 0.9999 (annealed during warmdown)
   SWA:               every 50 steps when LR scale < 0.2
@@ -219,9 +230,13 @@ Hardware:
 
 | Scenario | BPB | vs SOTA (1.1194) | Probability |
 |----------|-----|-------------------|-------------|
-| Best case | 1.085-1.095 | -0.025 to -0.035 | ~25% |
-| Expected case | 1.100-1.115 | -0.005 to -0.020 | ~45% |
-| Worst case | 1.130-1.150 | +0.010 to +0.030 | ~30% |
+| Best case | 1.095-1.105 | -0.015 to -0.025 | ~20% |
+| Expected case | 1.105-1.120 | -0.000 to -0.015 | ~45% |
+| Worst case | 1.130-1.150 | +0.010 to +0.030 | ~35% |
+
+Note: PHM does not reduce FLOPs (corrected from earlier analysis). Training
+step count is comparable to baseline. The advantage is purely architectural:
+more depth and width per parameter stored.
 
 **Fallback plan:** If PHM underperforms, revert to standard linear layers with the full proven technique stack. The novel quantization (APoT) and evaluation (K-FAC TTT) innovations still apply.
 
