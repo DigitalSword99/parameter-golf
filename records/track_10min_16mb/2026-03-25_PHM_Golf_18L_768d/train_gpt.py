@@ -870,6 +870,114 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# SIZE ESTIMATION
+# -----------------------------
+
+def estimate_phm_size(args) -> None:
+    n = args.phm_n
+    d = args.model_dim
+    kv_dim = args.num_kv_heads * (d // args.num_heads)
+    hidden = args.mlp_mult * d
+    def phm_params(d_in, d_out):
+        return n * n * n + n * (d_out // n) * (d_in // n)
+    attn_per_layer = phm_params(d, d) + phm_params(d, kv_dim) * 2 + phm_params(d, d)
+    mlp_per_layer = phm_params(d, hidden) + phm_params(hidden, d)
+    per_layer = attn_per_layer + mlp_per_layer + d * 4
+    total = per_layer * args.num_layers
+    total += args.vocab_size * d
+    total += args.bigram_hash_buckets * d
+    compressed_est = total * 0.75 * 0.55 + 80_000
+    print(f"PHM-Golf estimate: {total:,} params, ~{compressed_est / 1e6:.1f} MB compressed")
+    if compressed_est > 15_500_000:
+        print(f"WARNING: close to 16MB limit!")
+
+
+# -----------------------------
+# SCORE-FIRST TTT EVALUATION
+# -----------------------------
+
+def eval_val_ttt(
+    args,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_lr: float = 0.002,
+    ttt_epochs: int = 3,
+    chunk_size: int = 32768,
+) -> tuple[float, float]:
+    """Legal Score-First TTT: score each chunk, then adapt on scored data.
+    Uses base_model directly (uncompiled) to avoid torch.compile conflicts."""
+    total_tokens = val_tokens.numel() - 1
+    num_chunks = total_tokens // chunk_size
+    if num_chunks == 0:
+        num_chunks = 1
+        chunk_size = total_tokens
+
+    # Only adapt S parameters (bulk weights). A matrices frozen via optimizer (not requires_grad).
+    ttt_params = [p for name, p in base_model.named_parameters() if '.S' in name and p.ndim == 3]
+
+    val_loss_sum = 0.0
+    val_token_count = 0
+    val_byte_count = 0.0
+
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size + 1, val_tokens.numel())
+        chunk_tokens = val_tokens[start:end].to(device=device, dtype=torch.int64)
+
+        # Phase 1: SCORE
+        base_model.eval()
+        with torch.inference_mode():
+            num_seqs = (chunk_tokens.numel() - 1) // args.train_seq_len
+            if num_seqs == 0:
+                continue
+            usable = num_seqs * args.train_seq_len
+            x = chunk_tokens[:usable].reshape(num_seqs, args.train_seq_len)
+            y = chunk_tokens[1:usable + 1].reshape(num_seqs, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                chunk_loss = base_model(x, y).item()
+
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(torch.float64)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+            val_loss_sum += chunk_loss * float(tgt_ids.numel())
+            val_token_count += tgt_ids.numel()
+            val_byte_count += token_bytes.sum().item()
+
+        # Phase 2: ADAPT (skip last chunk — never train on unscored data)
+        if chunk_idx < num_chunks - 1:
+            base_model.train()
+            ttt_optimizer = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
+            for epoch in range(ttt_epochs):
+                epoch_lr = ttt_lr * 0.5 * (1 + math.cos(math.pi * epoch / ttt_epochs))
+                for pg in ttt_optimizer.param_groups:
+                    pg['lr'] = epoch_lr
+                ttt_optimizer.zero_grad()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = base_model(x, y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+                ttt_optimizer.step()
+
+    # Aggregate across ranks
+    if dist.is_available() and dist.is_initialized():
+        stats = torch.tensor([val_loss_sum, float(val_token_count), val_byte_count], device=device)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        val_loss_sum, val_token_count, val_byte_count = stats[0].item(), stats[1].item(), stats[2].item()
+
+    val_loss = val_loss_sum / max(val_token_count, 1)
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = val_token_count / max(val_byte_count, 1)
+    return val_loss, bits_per_token * tokens_per_byte
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -879,6 +987,11 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
+    # Early size estimation (rank 0 only, before distributed init)
+    rank_early = int(os.environ.get("RANK", "0"))
+    if rank_early == 0:
+        estimate_phm_size(args)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1306,6 +1419,16 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
+
+    # Score-First TTT evaluation (uses uncompiled base_model)
+    torch.cuda.synchronize()
+    t_ttt = time.perf_counter()
+    ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+        args, base_model, rank, world_size, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(f"final_ttt val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
 
     if distributed:
         dist.destroy_process_group()

@@ -1,0 +1,19 @@
+{
+    "name": "PHM-Golf: Kronecker-Factored Transformer",
+    "github_username": "DigitalSword99",
+    "date": "2026-03-25",
+    "val_loss": null,
+    "val_bpb": null,
+    "bytes_model": null,
+    "bytes_code": null,
+    "bytes_total": null,
+    "metadata": {
+        "num_layers": 18,
+        "model_dim": 768,
+        "num_heads": 12,
+        "num_kv_heads": 4,
+        "mlp_mult": 3,
+        "phm_n": 4,
+        "techniques": ["PHM", "APoT", "LearnedRoPE", "BigramHash", "XSA", "LeakyReLU2", "EMA", "SWA", "CosineWarmdown", "MultiResSkips", "TTT"]
+    }
+}
