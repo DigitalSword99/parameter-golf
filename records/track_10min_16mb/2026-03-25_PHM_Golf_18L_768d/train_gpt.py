@@ -25,6 +25,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -815,10 +816,10 @@ class GPT(nn.Module):
         x0 = x
         encoder_outputs: list[Tensor] = []
 
-        # Encoder layers
+        # Encoder layers (gradient checkpointed to fit 18L/768d in 80GB H100)
         for i in range(self.num_encoder_layers):
             use_xsa = i >= self.num_layers - self.xsa_layers
-            x = self.blocks[i](x, x0, xsa=use_xsa)
+            x = grad_checkpoint(self.blocks[i], x, x0, use_xsa, use_reentrant=False)
             encoder_outputs.append(x)
 
         # Decoder layers with multi-resolution skip connections
@@ -830,7 +831,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[skip_weight_idx].to(dtype=x.dtype)[None, None, :] * encoder_outputs[enc_i]
                 skip_weight_idx += 1
             use_xsa = eff_idx >= self.num_layers - self.xsa_layers
-            x = self.blocks[eff_idx](x, x0, xsa=use_xsa)
+            x = grad_checkpoint(self.blocks[eff_idx], x, x0, use_xsa, use_reentrant=False)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
