@@ -1236,7 +1236,8 @@ def main() -> None:
         elif isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # fullgraph=False: MoE routing uses data-dependent mask.any() which breaks fullgraph
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Hydra-3 optimizer groups
