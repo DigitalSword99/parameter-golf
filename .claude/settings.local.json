@@ -44,7 +44,15 @@
       "Bash(git push:*)",
       "Bash(echo $RUNPOD_API_KEY)",
       "Bash(python:*)",
-      "Bash(gh api:*)"
+      "Bash(gh api:*)",
+      "Bash(du -sh /mnt/g/parameter-golf/*)",
+      "Bash(wc:*)",
+      "Bash(find /mnt/g/parameter-golf/logs -type f -name *.log -o -name *.txt)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:www.aussieai.com)",
+      "WebFetch(domain:www.nature.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/openai/parameter-golf/main/records/track_10min_16mb/2026-03-22_11L_EMA_GPTQ-lite_warmdown3500_QAT015_1.1233/README.md\")"
     ]
   }
 }
