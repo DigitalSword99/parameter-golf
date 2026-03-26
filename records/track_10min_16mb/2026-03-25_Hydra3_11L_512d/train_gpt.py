@@ -750,14 +750,14 @@ class MoEMLP(nn.Module):
         frac = tokens_per_expert / flat_x.size(0)
         avg_prob = router_probs.mean(dim=0)
         aux_loss = (frac * avg_prob).sum() * self.num_experts
-        # Expert forward
+        # Expert forward — padded batch dispatch (no data-dependent branching)
+        # Run all experts on all tokens, mask-select correct output per token.
+        # Wastes FLOPs but enables fullgraph=True for torch.compile.
         output = torch.zeros_like(flat_x)
         for e in range(self.num_experts):
-            mask = (expert_idx == e)
-            if mask.any():
-                ei = flat_x[mask]
-                h = F.leaky_relu(self.expert_fc[e](ei), negative_slope=0.5)
-                output[mask] = self.expert_proj[e](h.square())
+            mask = (expert_idx == e).unsqueeze(-1).to(flat_x.dtype)
+            h = F.leaky_relu(self.expert_fc[e](flat_x), negative_slope=0.5)
+            output = output + mask * self.expert_proj[e](h.square())
         return output.reshape(x.shape), aux_loss
 
 
@@ -771,7 +771,7 @@ class DenseMLP3x(nn.Module):
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         h = F.leaky_relu(self.fc(x), negative_slope=0.5)
-        return self.proj(h.square()), torch.tensor(0.0, device=x.device)
+        return self.proj(h.square()), x.new_zeros(())
 
 
 class WideMLP(nn.Module):
@@ -788,7 +788,7 @@ class WideMLP(nn.Module):
         x = self.up(x)
         h = F.leaky_relu(self.fc(x), negative_slope=0.5)
         x = self.down(self.proj(h.square()))
-        return x, torch.tensor(0.0, device=x.device)
+        return x, x.new_zeros(())
 
 
 # -----------------------------
@@ -921,7 +921,7 @@ class GPT(nn.Module):
         x = x + self.trigram_hash(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        total_aux = torch.tensor(0.0, device=x.device)
+        total_aux = x.new_zeros(())
         encoder_outputs: list[Tensor] = []
 
         # Select heads
@@ -1236,8 +1236,7 @@ def main() -> None:
         elif isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # fullgraph=False: MoE routing uses data-dependent mask.any() which breaks fullgraph
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Hydra-3 optimizer groups
