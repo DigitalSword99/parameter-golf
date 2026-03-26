@@ -85,7 +85,7 @@ class Hyperparameters:
 
     # Hydra-3 ensemble additions.
     trigram_hash_buckets = int(os.environ.get("TRIGRAM_HASH_BUCKETS", 4096))
-    num_moe_experts = int(os.environ.get("NUM_MOE_EXPERTS", 8))
+    num_moe_experts = int(os.environ.get("NUM_MOE_EXPERTS", 6))
     moe_aux_loss_weight = float(os.environ.get("MOE_AUX_LOSS_WEIGHT", 0.01))
     num_heads_ensemble = int(os.environ.get("NUM_HEADS_ENSEMBLE", 3))
     head_b_mlp_mult = int(os.environ.get("HEAD_B_MLP_MULT", 3))
@@ -762,11 +762,11 @@ class MoEMLP(nn.Module):
 
 
 class DenseMLP3x(nn.Module):
-    """Dense 3x expansion MLP -- matches SOTA architecture."""
-    def __init__(self, dim: int, mlp_mult: int = 3):
+    """Dense 3x expansion MLP with PHM compression."""
+    def __init__(self, dim: int, mlp_mult: int = 3, phm_n: int = 4):
         super().__init__()
-        self.fc = CastedLinear(dim, dim * mlp_mult, bias=False)
-        self.proj = CastedLinear(dim * mlp_mult, dim, bias=False)
+        self.fc = PHMLinear(dim, dim * mlp_mult, n=phm_n)
+        self.proj = PHMLinear(dim * mlp_mult, dim, n=phm_n)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
@@ -775,13 +775,13 @@ class DenseMLP3x(nn.Module):
 
 
 class WideMLP(nn.Module):
-    """Project to wider dim, apply 2x MLP, project back."""
-    def __init__(self, dim: int, wide_dim: int = 640):
+    """Project to wider dim, apply 2x MLP, project back. PHM compressed."""
+    def __init__(self, dim: int, wide_dim: int = 640, phm_n: int = 4):
         super().__init__()
-        self.up = CastedLinear(dim, wide_dim, bias=False)
-        self.fc = CastedLinear(wide_dim, wide_dim * 2, bias=False)
-        self.proj = CastedLinear(wide_dim * 2, wide_dim, bias=False)
-        self.down = CastedLinear(wide_dim, dim, bias=False)
+        self.up = PHMLinear(dim, wide_dim, n=phm_n)
+        self.fc = PHMLinear(wide_dim, wide_dim * 2, n=phm_n)
+        self.proj = PHMLinear(wide_dim * 2, wide_dim, n=phm_n)
+        self.down = PHMLinear(wide_dim, dim, n=phm_n)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
@@ -896,8 +896,8 @@ class GPT(nn.Module):
 
         # Three MLP heads: MoE (A), Dense3x (B), Wide (C)
         self.head_a = nn.ModuleList([MoEMLP(model_dim, mlp_mult, num_experts=num_moe_experts, phm_n=phm_n) for _ in range(num_layers)])
-        self.head_b = nn.ModuleList([DenseMLP3x(model_dim, mlp_mult=head_b_mlp_mult) for _ in range(num_layers)])
-        self.head_c = nn.ModuleList([WideMLP(model_dim, wide_dim=head_c_wide_dim) for _ in range(num_layers)])
+        self.head_b = nn.ModuleList([DenseMLP3x(model_dim, mlp_mult=head_b_mlp_mult, phm_n=phm_n) for _ in range(num_layers)])
+        self.head_c = nn.ModuleList([WideMLP(model_dim, wide_dim=head_c_wide_dim, phm_n=phm_n) for _ in range(num_layers)])
         self.heads = nn.ModuleList([self.head_a, self.head_b, self.head_c])
 
         self.final_norm = RMSNorm()
@@ -1001,10 +1001,10 @@ def estimate_hydra3_size(args) -> None:
 
     # Head A: MoE with PHM experts
     moe_per_layer = args.num_moe_experts * (phm_params(d, hidden_a) + phm_params(hidden_a, d)) + d * args.num_moe_experts  # router
-    # Head B: Dense CastedLinear
-    dense_per_layer = d * hidden_b + hidden_b * d
-    # Head C: Wide CastedLinear
-    wide_per_layer = d * wide + wide * (wide * 2) + (wide * 2) * wide + wide * d
+    # Head B: Dense PHM
+    dense_per_layer = phm_params(d, hidden_b) + phm_params(hidden_b, d)
+    # Head C: Wide PHM
+    wide_per_layer = phm_params(d, wide) + phm_params(wide, wide * 2) + phm_params(wide * 2, wide) + phm_params(wide, d)
 
     per_layer = attn_per_layer + block_scalars + moe_per_layer + dense_per_layer + wide_per_layer
     total = per_layer * args.num_layers
