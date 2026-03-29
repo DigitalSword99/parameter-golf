@@ -1132,7 +1132,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = max(2, 8 // world_size)
+    grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1404,6 +1404,13 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            # Checkpoint save at each validation so pod loss doesn't lose the run
+            if master_process:
+                ckpt = {name: p.data.clone() for name, p in base_model.named_parameters()}
+                for name in ckpt:
+                    ckpt[name] = 0.5 * ema_params[name] + 0.5 * ckpt[name]
+                torch.save(ckpt, f"checkpoint_step{step}.pt")
+                log0(f"checkpoint saved: checkpoint_step{step}.pt")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
