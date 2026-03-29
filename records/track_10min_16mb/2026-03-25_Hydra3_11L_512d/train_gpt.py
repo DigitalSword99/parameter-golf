@@ -91,8 +91,8 @@ class Hyperparameters:
     head_b_mlp_mult = int(os.environ.get("HEAD_B_MLP_MULT", 3))
     head_c_wide_dim = int(os.environ.get("HEAD_C_WIDE_DIM", 640))
     ttt_lr = float(os.environ.get("TTT_LR", 0.001))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 10))
-    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 32768))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 131072))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -340,7 +340,7 @@ def build_apot_levels(bit_width: int = 6) -> Tensor:
                 levels.add(float(p1 + p2 + p3))
     return torch.tensor(sorted(levels), dtype=torch.float32)
 
-APOT_LEVELS = build_apot_levels(6)
+APOT_LEVELS = build_apot_levels(4)  # 4-bit: 7 positive levels → 15 signed entries
 
 def build_signed_apot_codebook(levels: Tensor) -> Tensor:
     """Build signed codebook: [-max, ..., -1, 0, 1, ..., max]. Index 0 = most negative."""
@@ -348,11 +348,11 @@ def build_signed_apot_codebook(levels: Tensor) -> Tensor:
     neg = -pos.flip(0)
     return torch.cat([neg, torch.zeros(1), pos])  # len = 2*num_positive + 1
 
-APOT_CODEBOOK = build_signed_apot_codebook(APOT_LEVELS)  # 51 entries, fits in int8 (-25 to +25)
+APOT_CODEBOOK = build_signed_apot_codebook(APOT_LEVELS)  # 15 entries, fits in 4 bits (0..14)
 
 def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, codebook: Tensor, n_candidates: int = 5) -> tuple[Tensor, Tensor]:
     """Per-row APoT quantization with GPTQ-lite clip search.
-    Returns (signed_indices: int8, scales: fp16). No separate sign storage needed."""
+    Returns (nibble-packed indices: uint8, scales: fp16). Two 4-bit indices per byte."""
     t32 = t.float()
     candidates = [0.999, 0.9995, 0.9999, 0.99999, 1.0][:n_candidates]
     best_indices = None
@@ -368,29 +368,50 @@ def quantize_apot_gptq_lite(t: Tensor, levels: Tensor, codebook: Tensor, n_candi
         clip_abs = clip_abs.clamp_min(1e-8)
         scale = clip_abs / max_level
         normalized = (t32 / scale).clamp(-max_level, max_level)
-        # Find nearest signed codebook entry for each element
         dists = (normalized.unsqueeze(-1) - cb.unsqueeze(0).unsqueeze(0)).abs()
         indices = dists.argmin(dim=-1)
-        # Reconstruct to compute MSE
         q_vals = cb[indices] * scale
         mse = (q_vals - t32).pow(2).mean().item()
         if mse < best_mse:
             best_mse = mse
-            best_indices = indices.to(torch.int8)  # int8: -128..127, we use 0..50
+            best_indices = indices.to(torch.uint8)
             best_scale = scale.squeeze(-1).to(torch.float16)
-    return best_indices, best_scale
+    # Nibble-pack: two 4-bit indices per byte (high nibble = even col, low nibble = odd col)
+    packed = pack_nibbles(best_indices)
+    return packed, best_scale
 
-def dequantize_apot(indices: Tensor, scales: Tensor, codebook: Tensor) -> Tensor:
-    """Reconstruct float tensor from signed codebook indices + per-row scales."""
+def pack_nibbles(indices: Tensor) -> Tensor:
+    """Pack pairs of 4-bit indices into single bytes. Pads odd columns with 0."""
+    rows, cols = indices.shape
+    if cols % 2 != 0:
+        indices = torch.cat([indices, torch.zeros(rows, 1, dtype=indices.dtype, device=indices.device)], dim=1)
+        cols += 1
+    even = indices[:, 0::2]  # high nibble
+    odd = indices[:, 1::2]   # low nibble
+    return ((even << 4) | odd).to(torch.uint8)
+
+def unpack_nibbles(packed: Tensor, cols: int) -> Tensor:
+    """Unpack nibble-packed bytes back to individual indices."""
+    high = (packed >> 4) & 0x0F
+    low = packed & 0x0F
+    rows = packed.shape[0]
+    unpacked = torch.zeros(rows, high.shape[1] * 2, dtype=torch.uint8, device=packed.device)
+    unpacked[:, 0::2] = high
+    unpacked[:, 1::2] = low
+    return unpacked[:, :cols]
+
+def dequantize_apot(packed: Tensor, scales: Tensor, codebook: Tensor, cols: int) -> Tensor:
+    """Reconstruct float tensor from nibble-packed indices + per-row scales."""
+    indices = unpack_nibbles(packed, cols)
     cb = codebook.to(indices.device)
-    q_vals = cb[indices.long()]  # (rows, cols) -- already signed
+    q_vals = cb[indices.long()]
     return q_vals * scales.float().unsqueeze(1)
 
 def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
-    """Quantize PHM model using signed APoT codebook indices (int8) + per-row fp16 scales.
-    No separate sign storage -- signs are embedded in the codebook index."""
-    q_indices: dict[str, Tensor] = {}
+    """Quantize PHM model using 4-bit APoT with nibble packing (2 indices per byte)."""
+    q_packed: dict[str, Tensor] = {}
     q_scales: dict[str, Tensor] = {}
+    q_cols: dict[str, int] = {}  # original column count for unpacking
     passthrough: dict[str, Tensor] = {}
     stats = {"param_count": 0, "total_bytes": 0}
     levels = APOT_LEVELS
@@ -413,40 +434,46 @@ def quantize_state_dict_phm(state_dict: dict[str, Tensor]):
             continue
         if t.ndim == 3 and '.S' in name:
             idx_slices, scale_slices = [], []
+            orig_cols = t.shape[2]
             for i in range(t.shape[0]):
                 idx, sc = quantize_apot_gptq_lite(t[i], levels, codebook)
                 idx_slices.append(idx)
                 scale_slices.append(sc)
-            q_indices[name] = torch.stack(idx_slices)
+            q_packed[name] = torch.stack(idx_slices)
             q_scales[name] = torch.stack(scale_slices)
-            stats["total_bytes"] += q_indices[name].numel() + q_scales[name].numel() * 2
+            q_cols[name] = orig_cols
+            stats["total_bytes"] += q_packed[name].numel() + q_scales[name].numel() * 2
             continue
         if t.ndim == 2 and t.numel() > 65_536:
+            orig_cols = t.shape[1]
             idx, sc = quantize_apot_gptq_lite(t, levels, codebook)
-            q_indices[name] = idx
+            q_packed[name] = idx
             q_scales[name] = sc
+            q_cols[name] = orig_cols
             stats["total_bytes"] += idx.numel() + sc.numel() * 2
             continue
         passthrough[name] = t.to(torch.float16)
         stats["total_bytes"] += t.numel() * 2
 
-    return {"q_indices": q_indices, "q_scales": q_scales,
+    return {"q_packed": q_packed, "q_scales": q_scales, "q_cols": q_cols,
             "passthrough": passthrough, "apot_codebook": codebook}, stats
 
 def dequantize_state_dict_phm(obj: dict[str, object]) -> dict[str, Tensor]:
-    """Reconstruct float tensors from signed APoT codebook indices."""
+    """Reconstruct float tensors from nibble-packed 4-bit APoT indices."""
     out: dict[str, Tensor] = {}
     codebook = obj["apot_codebook"]
-    for name in obj["q_indices"]:
-        indices = obj["q_indices"][name]
+    q_cols = obj["q_cols"]
+    for name in obj["q_packed"]:
+        packed = obj["q_packed"][name]
         scales = obj["q_scales"][name]
-        if indices.ndim == 3:
+        cols = q_cols[name]
+        if packed.ndim == 3:
             slices = []
-            for i in range(indices.shape[0]):
-                slices.append(dequantize_apot(indices[i], scales[i], codebook))
+            for i in range(packed.shape[0]):
+                slices.append(dequantize_apot(packed[i], scales[i], codebook, cols))
             out[name] = torch.stack(slices)
         else:
-            out[name] = dequantize_apot(indices, scales, codebook)
+            out[name] = dequantize_apot(packed, scales, codebook, cols)
     for name, t in obj["passthrough"].items():
         out[name] = t
     return out
@@ -1012,8 +1039,9 @@ def estimate_hydra3_size(args) -> None:
     total += args.bigram_hash_buckets * d  # bigram
     total += args.trigram_hash_buckets * d  # trigram
 
-    compressed_est = total * 0.75 * 0.55 + 80_000
-    print(f"Hydra-3 estimate: {total:,} params, ~{compressed_est / 1e6:.1f} MB compressed")
+    # 4-bit nibble packing: ~0.5 bytes/param for quantized, ~2 bytes for passthrough small params
+    compressed_est = total * 0.5 * 0.70 + 200_000
+    print(f"Hydra-3 estimate: {total:,} params, ~{compressed_est / 1e6:.1f} MB compressed (4-bit)")
     if compressed_est > 15_500_000:
         print(f"WARNING: close to 16MB limit!")
 
@@ -1548,10 +1576,12 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(decompress_auto(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_phm(quant_state), strict=True)
+
+    # Roundtrip eval uses base_model directly — compiled model may not reflect weight updates
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
+        args, base_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
