@@ -12,8 +12,8 @@
         "model_dim": 512,
         "num_heads": 8,
         "num_kv_heads": 4,
-        "num_moe_experts": 8,
-        "heads": ["MoE_PHM_8exp", "Dense_3x", "Wide_640_2x"],
+        "num_moe_experts": 6,
+        "heads": ["MoE_PHM_6exp", "Dense_3x", "Wide_640_2x"],
         "techniques": ["Ensemble", "MoE", "PHM", "APoT", "LearnedRoPE", "BigramHash", "TrigramHash", "XSA", "LeakyReLU2", "EMA", "SWA", "CosineWarmdown", "MultiResSkips", "AggressiveTTT"]
     }
 }
